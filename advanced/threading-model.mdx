@@ -1,0 +1,193 @@
+---
+title: "libTorrent's Multi-Thread Architecture"
+description: "Learn how libTorrent's main, network, and tracker threads interact, how to initialize them correctly, and how to schedule cross-thread callbacks safely."
+---
+
+libTorrent runs across multiple threads to keep disk I/O, network polling, and your application logic from blocking each other. Understanding which thread owns which resource—and how to schedule work on the right thread—is essential for writing a correct embedding application.
+
+## The three-thread model
+
+libTorrent divides its work into three long-lived threads:
+
+| Thread | Purpose |
+|--------|---------|
+| **Main thread** | Runs your application event loop, hash checking, and user-facing state changes |
+| **Network thread** (`net_thread`) | Drives all socket I/O via `epoll`/`kqueue` and tracker HTTP requests |
+| **Tracker thread** | Handles periodic tracker announces and scrape requests |
+
+Your process owns the main thread. The library creates and manages the network and tracker threads internally.
+
+## Initialization sequence
+
+You must call these functions in order, from your main thread, before doing anything else with the library.
+
+<Steps>
+  <Step title="Call initialize_main_thread()">
+    Records the calling OS thread as libTorrent's main thread and seeds the random number generators.
+
+    ```cpp
+    torrent::initialize_main_thread();
+    ```
+
+    <Warning>
+      Call this exactly once, before any other libTorrent function. Calling it from a non-main thread produces undefined behavior.
+    </Warning>
+  </Step>
+  <Step title="Register a work callback">
+    The library needs a way to wake your event loop when it has pending main-thread work. Pass a callable that triggers one iteration of your loop.
+
+    ```cpp
+    torrent::set_main_thread_slots([]() {
+      // Wake your event loop, e.g. write to a pipe or post to a queue.
+      my_app_wake_event_loop();
+    });
+    ```
+  </Step>
+  <Step title="Call initialize()">
+    Starts the network and tracker threads, sets up internal managers, and opens the listen socket.
+
+    ```cpp
+    torrent::initialize();
+    ```
+  </Step>
+</Steps>
+
+To tear down the library cleanly, call `torrent::cleanup()` after stopping all downloads.
+
+```cpp
+bool torrent::is_initialized(); // true after initialize() succeeds
+bool torrent::is_inactive();    // true when all downloads are stopped
+```
+
+## torrent::this_thread
+
+The `torrent::this_thread` namespace provides access to the resources owned by whichever thread is currently executing. Every libTorrent thread has its own `Poll`, `Resolver`, and `Scheduler` instance.
+
+### Identifying the current thread
+
+```cpp
+torrent::utils::Thread* torrent::this_thread::thread();
+std::thread::id         torrent::this_thread::thread_id();
+```
+
+### Cached time
+
+libTorrent maintains a cached clock value that is updated at the start of each event loop iteration. Use `cached_time()` instead of calling the system clock directly—it avoids unnecessary syscalls on the hot I/O path.
+
+```cpp
+std::chrono::microseconds torrent::this_thread::cached_time();
+std::chrono::seconds      torrent::this_thread::cached_seconds();
+```
+
+<Tip>
+  Prefer `cached_time()` over `std::chrono::steady_clock::now()` inside any libTorrent callback. The cached value is accurate enough for scheduling and avoids the overhead of a syscall on every event.
+</Tip>
+
+### Scheduling callbacks
+
+Post a callback to execute on the current thread. The `target` pointer acts as a cancellation key—cancel by passing the same pointer to `cancel_callback`.
+
+```cpp
+// Schedule a callback on the current thread.
+torrent::this_thread::callback(void* target, std::function<void()>&& fn);
+
+// Cancel a pending callback (non-blocking).
+torrent::this_thread::cancel_callback(void* target);
+
+// Cancel and wait for any in-progress execution to finish.
+torrent::this_thread::cancel_callback_and_wait(void* target);
+```
+
+### I/O primitives
+
+```cpp
+torrent::net::Poll*       torrent::this_thread::poll();
+torrent::net::Resolver*   torrent::this_thread::resolver();
+torrent::utils::Scheduler* torrent::this_thread::scheduler();
+```
+
+### Event registration
+
+Register file descriptors with the current thread's poll instance using these weak-symbol functions. They dispatch to the `Poll` object owned by the running thread.
+
+```cpp
+// Open a file descriptor for polling.
+torrent::this_thread::event_open(Event* event);
+torrent::this_thread::event_open_and_count(Event* event);
+
+// Add readiness interest.
+torrent::this_thread::event_insert_read(Event* event);
+torrent::this_thread::event_insert_write(Event* event);
+torrent::this_thread::event_insert_error(Event* event);
+
+// Remove readiness interest.
+torrent::this_thread::event_remove_read(Event* event);
+torrent::this_thread::event_remove_write(Event* event);
+torrent::this_thread::event_remove_error(Event* event);
+
+// Remove from poll and close the file descriptor.
+torrent::this_thread::event_remove_and_close(Event* event);
+```
+
+<Note>
+  These functions are declared `[[gnu::weak]]`. They resolve at link time to the implementation installed by whichever thread's event loop is active, so calling them from the wrong thread will silently operate on the wrong `Poll` instance.
+</Note>
+
+## torrent::main_thread
+
+The `torrent::main_thread` namespace lets any thread post work back to the main thread.
+
+```cpp
+torrent::utils::Thread* torrent::main_thread::thread();
+std::thread::id         torrent::main_thread::thread_id();
+
+// Post a callback to run on the main thread.
+void torrent::main_thread::callback(void* target, std::function<void()>&& fn);
+void torrent::main_thread::cancel_callback(void* target);
+void torrent::main_thread::cancel_callback_and_wait(void* target);
+
+// Number of pending hash-check jobs.
+uint32_t torrent::main_thread::hash_queue_size();
+```
+
+Use `hash_queue_size()` to back-pressure download starts: avoid calling `download_add()` when the queue is large.
+
+## torrent::net_thread
+
+The `torrent::net_thread` namespace lets you schedule work on the network thread, which owns all open sockets and the HTTP stack.
+
+```cpp
+torrent::utils::Thread* torrent::net_thread::thread();
+std::thread::id         torrent::net_thread::thread_id();
+
+// Post a callback to the net thread's queue.
+void torrent::net_thread::callback(void* target, std::function<void()>&& fn);
+
+// Post a callback and immediately interrupt epoll/kqueue so it runs without delay.
+void torrent::net_thread::callback_interrupt_polling(void* target, std::function<void()>&& fn);
+void torrent::net_thread::callback_interrupt_polling_and_wait(void* target, std::function<void()>&& fn);
+
+void torrent::net_thread::cancel_callback(void* target);
+void torrent::net_thread::cancel_callback_and_wait(void* target);
+
+// Access the HTTP client used for tracker announcements.
+torrent::net::HttpStack* torrent::net_thread::http_stack();
+```
+
+<Warning>
+  Do not call `net_thread::http_stack()` from the main thread and pass the pointer to code that runs on another thread without synchronization. The `HttpStack` is owned by the net thread.
+</Warning>
+
+## Thread safety rules
+
+<AccordionGroup>
+  <Accordion title="Callbacks are the only safe cross-thread mechanism">
+    Never call a libTorrent object method directly from a different thread than the one that owns it. Instead, use `callback()` to post work to the owning thread.
+  </Accordion>
+  <Accordion title="cancel_callback_and_wait() prevents races on object destruction">
+    Before destroying an object that has pending callbacks, call `cancel_callback_and_wait()` with its address. This blocks until any in-progress callback finishes, preventing use-after-free.
+  </Accordion>
+  <Accordion title="callback_interrupt_polling() for latency-sensitive work">
+    The net thread may block inside `epoll_wait` for up to its poll timeout. If you need the net thread to act immediately (for example, to connect a new peer), use `callback_interrupt_polling()` rather than plain `callback()`.
+  </Accordion>
+</AccordionGroup>

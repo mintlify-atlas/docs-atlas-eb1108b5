@@ -1,0 +1,519 @@
+---
+title: "Object class and bencode serialization API reference"
+description: "Reference for the Object variant type, raw bencode views, map and list operations, flag management, and stream I/O helpers for parsing and writing bencode."
+---
+
+`Object` is libTorrent's universal variant type. It holds one of ten possible types — integers, strings, lists, maps, or raw bencode data — and is used throughout the library for torrent metadata, resume data, settings, and RPC responses. The bencode serialization functions in `object_stream.h` convert `Object` trees to and from the bencode wire format.
+
+```cpp
+#include <torrent/object.h>
+#include <torrent/object_raw_bencode.h>
+#include <torrent/object_stream.h>
+```
+
+## Type system
+
+### `type_type` enum
+
+```cpp
+enum type_type {
+    TYPE_NONE,         // default-constructed, empty
+    TYPE_RAW_BENCODE,  // raw bencoded bytes (unparsed)
+    TYPE_RAW_STRING,   // raw string bytes (no bencode framing)
+    TYPE_RAW_LIST,     // raw bencoded list bytes
+    TYPE_RAW_MAP,      // raw bencoded map bytes
+    TYPE_VALUE,        // int64_t integer
+    TYPE_STRING,       // std::string
+    TYPE_LIST,         // std::vector<Object>
+    TYPE_MAP,          // std::map<std::string, Object>
+    TYPE_DICT_KEY      // key+value pair (internal use)
+};
+```
+
+Raw types hold a pointer and length into an existing buffer — they do not own their memory. Use them when you want to defer parsing of a bencoded structure.
+
+### Type aliases
+
+```cpp
+using value_type    = int64_t;
+using string_type   = std::string;
+using list_type     = std::vector<Object>;
+using map_type      = std::map<std::string, Object>;
+using map_ptr_type  = map_type*;
+using key_type      = map_type::key_type;             // std::string
+using dict_key_type = std::pair<std::string, Object*>;
+```
+
+## Constructors
+
+```cpp
+Object();                          // TYPE_NONE
+Object(value_type v);              // TYPE_VALUE
+Object(const char* s);             // TYPE_STRING
+Object(const string_type& s);      // TYPE_STRING
+Object(const raw_bencode& r);      // TYPE_RAW_BENCODE
+Object(const raw_string& r);       // TYPE_RAW_STRING
+Object(const raw_list& r);         // TYPE_RAW_LIST
+Object(const raw_map& r);          // TYPE_RAW_MAP
+
+Object(const Object& b);           // deep copy
+Object& operator=(const Object& b);
+~Object();                         // releases owned heap memory
+```
+
+The copy constructor and assignment operator perform a deep copy for `TYPE_STRING`, `TYPE_LIST`, and `TYPE_MAP`. Raw types (`TYPE_RAW_*`) are shallow — they copy the pointer and length only.
+
+## Static factory methods
+
+Use factory methods when you need a type that has no matching constructor:
+
+```cpp
+static Object create_value();      // Object wrapping value_type(0)
+static Object create_string();     // Object wrapping an empty std::string
+static Object create_list();       // Object wrapping an empty list_type
+static Object create_map();        // Object wrapping an empty map_type
+static Object create_dict_key();   // TYPE_DICT_KEY with empty key and Object
+
+static Object create_raw_bencode(raw_bencode obj = raw_bencode());
+static Object create_raw_string(raw_string obj = raw_string());
+static Object create_raw_list(raw_list obj = raw_list());
+static Object create_raw_map(raw_map obj = raw_map());
+
+template <typename ForwardIterator>
+static Object create_list_range(ForwardIterator first, ForwardIterator last);
+
+static Object create_empty(type_type t); // factory dispatch by type
+
+static Object from_list(const list_type& src); // copy list into a new Object
+
+static const char* type_to_c_str(type_type t); // human-readable type name
+```
+
+```cpp
+// Build a list from a C++ range:
+std::vector<torrent::Object> items = { torrent::Object(int64_t(1)), torrent::Object("hello") };
+torrent::Object list = torrent::Object::create_list_range(items.begin(), items.end());
+
+// Create a map and insert entries:
+torrent::Object map = torrent::Object::create_map();
+map.insert_key("name", torrent::Object("example"));
+map.insert_key("size", torrent::Object(int64_t(1024)));
+```
+
+## Type queries
+
+```cpp
+type_type type() const;       // current type
+uint32_t  flags() const;      // flag bits (excluding type bits)
+void      clear();            // reset to TYPE_NONE, freeing owned memory
+
+bool is_empty() const;        // type() == TYPE_NONE
+bool is_not_empty() const;    // type() != TYPE_NONE
+bool is_value() const;
+bool is_string() const;
+bool is_string_empty() const; // type() != TYPE_STRING || string is empty
+bool is_list() const;
+bool is_map() const;
+bool is_dict_key() const;
+bool is_raw_bencode() const;
+bool is_raw_string() const;
+bool is_raw_list() const;
+bool is_raw_map() const;
+```
+
+## Value access
+
+All `as_*()` methods throw `bencode_error` if the object's current type does not match the requested type.
+
+```cpp
+value_type&        as_value();
+const value_type&  as_value() const;
+
+string_type&       as_string();
+const string_type& as_string() const;
+const string_type& as_string_c() const;  // const-only alias
+const char*        as_c_str() const;     // string.c_str()
+
+list_type&         as_list();
+const list_type&   as_list() const;
+
+map_type&          as_map();
+const map_type&    as_map() const;
+
+string_type&       as_dict_key();        // key portion of TYPE_DICT_KEY
+const string_type& as_dict_key() const;
+Object&            as_dict_obj();        // value portion of TYPE_DICT_KEY
+const Object&      as_dict_obj() const;
+
+raw_bencode&       as_raw_bencode();
+const raw_bencode& as_raw_bencode() const;
+raw_string&        as_raw_string();
+const raw_string&  as_raw_string() const;
+raw_list&          as_raw_list();
+const raw_list&    as_raw_list() const;
+raw_map&           as_raw_map();
+const raw_map&     as_raw_map() const;
+
+template <typename T>
+T as_value_type(const char* err_msg) const;
+```
+
+`as_value_type<T>()` casts the `int64_t` value to the integer type `T`, throwing `bencode_error` with `err_msg` if the object is not a value or if the value falls outside `T`'s range.
+
+```cpp
+torrent::Object obj(int64_t(42));
+int32_t n = obj.as_value_type<int32_t>("expected int32 in config");
+```
+
+## Map operations
+
+All map operations require `type() == TYPE_MAP`; they throw `bencode_error` otherwise.
+
+### Key existence checks
+
+```cpp
+bool has_key(const key_type& k) const;
+bool has_key_value(const key_type& k) const;
+bool has_key_string(const key_type& k) const;
+bool has_key_list(const key_type& k) const;
+bool has_key_map(const key_type& k) const;
+bool has_key_raw_bencode(const key_type& k) const;
+bool has_key_raw_string(const key_type& k) const;
+bool has_key_raw_list(const key_type& k) const;
+bool has_key_raw_map(const key_type& k) const;
+```
+
+### Key retrieval (throws on missing key)
+
+```cpp
+Object&       get_key(const key_type& k);
+const Object& get_key(const key_type& k) const;
+Object&       get_key(const char* k);
+const Object& get_key(const char* k) const;
+
+// Typed shortcuts — equivalent to get_key(k).as_*():
+template <typename T> value_type&        get_key_value(const T& k);
+template <typename T> const value_type&  get_key_value(const T& k) const;
+template <typename T> string_type&       get_key_string(const T& k);
+template <typename T> const string_type& get_key_string(const T& k) const;
+template <typename T> list_type&         get_key_list(const T& k);
+template <typename T> const list_type&   get_key_list(const T& k) const;
+template <typename T> map_type&          get_key_map(const T& k);
+template <typename T> const map_type&    get_key_map(const T& k) const;
+```
+
+### Key insertion
+
+```cpp
+Object&       insert_key(const key_type& k, const Object& b);      // copy b into map[k]
+Object&       insert_key_move(const key_type& k, Object& b);       // move b into map[k]
+
+using map_insert_type = std::pair<map_iterator, bool>;
+map_insert_type insert_preserve_any(const key_type& k, const Object& b);  // insert if absent
+map_insert_type insert_preserve_type(const key_type& k, Object& b);       // insert if absent and same type
+map_insert_type insert_preserve_copy(const key_type& k, Object b);        // copy variant of insert_preserve_type
+
+void erase_key(const key_type& k);
+```
+
+`insert_preserve_any` inserts `b` only if `k` does not yet exist in the map; it returns the existing entry and `false` if the key was already present. `insert_preserve_type` additionally requires the existing entry to be the same type as `b`.
+
+```cpp
+torrent::Object settings = torrent::Object::create_map();
+settings.insert_key("max_peers", torrent::Object(int64_t(50)));
+
+// Only insert "timeout" if not already present:
+settings.insert_preserve_any("timeout", torrent::Object(int64_t(30)));
+```
+
+## List operations
+
+```cpp
+Object& insert_front(const Object& b); // prepend to list
+Object& insert_back(const Object& b);  // append to list
+```
+
+Both methods require `type() == TYPE_LIST` and return a reference to the newly inserted element.
+
+## Flags
+
+The upper bits of the internal `m_flags` word are available for metadata annotation. libTorrent defines the following constants:
+
+```cpp
+static constexpr uint32_t mask_type     = 0xff;       // bits reserved for type_type
+static constexpr uint32_t mask_flags    = ~mask_type; // all non-type bits
+static constexpr uint32_t mask_internal = 0xffff;     // bits reserved for libTorrent
+static constexpr uint32_t mask_public   = ~mask_internal; // bits available to callers
+
+// Internal flags (0x00ff0000 range — libTorrent use only):
+static constexpr uint32_t flag_unordered   = 0x100;    // bencode map was not sorted
+static constexpr uint32_t flag_static_data = 0x010000; // value does not change between sessions
+static constexpr uint32_t flag_session_data= 0x020000; // value changes between sessions
+static constexpr uint32_t flag_function    = 0x040000; // this object is a function
+static constexpr uint32_t flag_function_q1 = 0x080000; // quoted function
+static constexpr uint32_t flag_function_q2 = 0x100000; // double-quoted function
+static constexpr uint32_t mask_function    = 0x1C0000; // mask for all function flags
+```
+
+```cpp
+void set_flags(uint32_t f);           // set bits in mask_public range only
+void unset_flags(uint32_t f);         // clear bits in mask_public range only
+void set_internal_flags(uint32_t f);  // set bits in (mask_internal & ~mask_type)
+void unset_internal_flags(uint32_t f);
+```
+
+Callers should only use `set_flags` / `unset_flags` with bits in the `mask_public` range (`0xffff0000` and above, excluding `0x00ff0000`). Flags in `mask_internal` are reserved for the library.
+
+## Copy and merge
+
+```cpp
+Object& move(Object& b) noexcept;            // steal b's content, leaving b as TYPE_NONE
+Object& swap(Object& b) noexcept;            // exchange contents with b
+Object& swap_same_type(Object& b) noexcept;  // swap contents (both must be same type)
+
+// Merge all map entries from 'object' into this (only works for TYPE_MAP):
+Object& merge_move(Object& object, uint32_t maxDepth = ~uint32_t());
+Object& merge_copy(const Object& object,
+                   uint32_t skip_mask = flag_static_data,
+                   uint32_t maxDepth  = ~uint32_t());
+```
+
+`merge_copy()` copies map entries from `object` into `*this`, skipping entries whose flags match `skip_mask`. The default `skip_mask` of `flag_static_data` skips keys that are marked as static (unlikely to need re-saving). Set `maxDepth` to limit recursive merging.
+
+## Free functions
+
+### Object creation helpers
+
+```cpp
+// Convert raw bencode objects to fully parsed Objects:
+Object object_create_normal(const raw_bencode& obj); // parse bencode
+Object object_create_normal(const raw_list& obj);    // parse list
+Object object_create_normal(const raw_map& obj);     // parse map
+Object object_create_normal(const raw_string& obj);  // convert to string Object
+Object object_create_normal(const Object& obj);      // dispatch by type
+
+// Convert an Object to a std::string (raw_bencode and raw_string aware):
+std::string object_create_string(const torrent::Object& obj);
+
+// Wrap a C string literal as a raw_bencode Object without copying:
+inline Object object_create_raw_bencode_c_str(const char str[]);
+```
+
+### Comparison
+
+```cpp
+bool object_equal(const Object& left, const Object& right);
+```
+
+`object_equal` compares by value for `TYPE_NONE`, `TYPE_VALUE`, and `TYPE_STRING`. All other type combinations return `false`.
+
+```cpp
+void swap(Object& left, Object& right) noexcept; // free-function swap (calls left.swap(right))
+```
+
+---
+
+## Bencode stream I/O
+
+The functions in `object_stream.h` serialize and deserialize `Object` trees to and from the bencode format.
+
+### Reading bencode
+
+```cpp
+// Parse from a C++ input stream:
+void object_read_bencode(std::istream* input, Object* object, uint32_t depth = 0);
+
+// Parse from a C string buffer [first, last):
+const char* object_read_bencode_c(const char* first, const char* last,
+                                  Object* object, uint32_t depth = 0);
+
+// Skip (without parsing) a single bencode value in [first, last):
+const char* object_read_bencode_skip_c(const char* first, const char* last);
+
+// Extract a raw_string from a bencoded string in [first, last):
+raw_string object_read_bencode_c_string(const char* first, const char* last);
+
+// Stream extraction operator (calls object_read_bencode):
+std::istream& operator>>(std::istream& input, Object& object);
+```
+
+<Warning>
+  The stream locale must be set to `POSIX` or `C` before calling any read or write function. Number formatting is locale-dependent in bencode.
+</Warning>
+
+The maximum recursion depth is 1024 for both stream and C-buffer variants. This limit prevents stack overflow when parsing malformed or adversarial input.
+
+```cpp
+#include <fstream>
+#include <torrent/object.h>
+#include <torrent/object_stream.h>
+
+std::ifstream f("file.torrent", std::ios::binary);
+f.imbue(std::locale::classic());
+
+torrent::Object torrent_data;
+f >> torrent_data;  // or: object_read_bencode(&f, &torrent_data);
+
+std::string name = torrent_data.get_key("info").get_key_string("name");
+```
+
+### Writing bencode
+
+```cpp
+// Write to a C++ output stream:
+void object_write_bencode(std::ostream* output, const Object* object,
+                          uint32_t skip_mask = 0);
+
+// Write to a char buffer [first, last); returns {next_write, end}:
+using object_buffer_t = std::pair<char*, char*>;
+object_buffer_t object_write_bencode(char* first, char* last,
+                                     const Object* object, uint32_t skip_mask = 0);
+
+// Generic write with a pluggable sink function:
+using object_write_t = object_buffer_t (*)(void* data, object_buffer_t buffer);
+object_buffer_t object_write_bencode_c(object_write_t writeFunc, void* data,
+                                       object_buffer_t buffer,
+                                       const Object* object,
+                                       uint32_t skip_mask = 0);
+
+// Stream insertion operator:
+std::ostream& operator<<(std::ostream& output, const Object& object);
+```
+
+`skip_mask` causes entries whose flags match the mask to be omitted from the output. For example, pass `flag_session_data` to write only static configuration keys.
+
+### Sink functions for `object_write_bencode_c`
+
+```cpp
+object_buffer_t object_write_to_buffer(void* data, object_buffer_t buffer); // write to char buffer
+object_buffer_t object_write_to_sha1(void* data, object_buffer_t buffer);   // feed into SHA-1 hash
+object_buffer_t object_write_to_stream(void* data, object_buffer_t buffer);  // write to std::ostream*
+object_buffer_t object_write_to_size(void* data, object_buffer_t buffer);    // measure size only (data = uint64_t*)
+```
+
+### SHA-1 of an Object
+
+```cpp
+std::string object_sha1(const Object* object);
+```
+
+Serializes `object` to bencode and returns the hex-encoded SHA-1 digest. This is used to compute the info-hash of a torrent.
+
+<AccordionGroup>
+  <Accordion title="Write bencode to a buffer">
+
+```cpp
+char buf[4096];
+torrent::object_buffer_t result =
+    torrent::object_write_bencode(buf, buf + sizeof(buf), &my_object);
+
+size_t written = result.first - buf;
+// buf[0..written) contains the bencoded data
+```
+
+  </Accordion>
+
+  <Accordion title="Measure serialized size">
+
+```cpp
+uint64_t size = 0;
+char tmp[256];
+torrent::object_write_bencode_c(
+    torrent::object_write_to_size,
+    &size,
+    { tmp, tmp + sizeof(tmp) },
+    &my_object
+);
+// size now holds the total bencode byte count
+```
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Raw bencode types
+
+The raw bencode types in `object_raw_bencode.h` represent non-owning views into an existing byte buffer. They are lightweight and copy/assign in O(1). All four types expose the same `raw_object` interface.
+
+### `raw_object` (base class)
+
+```cpp
+bool        empty() const;
+size_type   size() const;  // size_type = uint32_t
+iterator    begin() const; // const char*
+iterator    end() const;
+value_type* data() const;  // const char*
+
+bool operator==(const raw_object& rhs) const; // memcmp comparison
+bool operator!=(const raw_object& rhs) const;
+```
+
+### `raw_bencode`
+
+Holds valid bencoded bytes or is empty. Provides type-checking accessors:
+
+```cpp
+bool is_empty() const;
+bool is_value() const;      // starts with 'i'
+bool is_raw_string() const; // starts with digit '0'–'9'
+bool is_raw_list() const;   // starts with 'l'
+bool is_raw_map() const;    // starts with 'd'
+
+std::string as_value_string() const; // strip 'i' and 'e' framing
+raw_string  as_raw_string() const;   // strip length prefix
+raw_list    as_raw_list() const;     // strip 'l'/'e' framing
+raw_map     as_raw_map() const;      // strip 'd'/'e' framing
+
+static raw_bencode from_c_str(const char* str); // strlen-based constructor
+```
+
+### `raw_string`
+
+A non-owning view of raw string bytes (no bencode framing):
+
+```cpp
+std::string as_string() const; // copy into a std::string
+
+static raw_string from_c_str(const char* str);
+static raw_string from_string(const std::string& str);
+```
+
+### `raw_list`
+
+A non-owning view of the interior bytes of a bencoded list (content between `l` and `e`):
+
+```cpp
+static raw_list from_c_str(const char* str);
+```
+
+### `raw_map`
+
+A non-owning view of the interior bytes of a bencoded dictionary (content between `d` and `e`):
+
+```cpp
+raw_map() = default;
+raw_map(value_type* src_data, size_type src_size);
+```
+
+### Helper free functions
+
+```cpp
+bool raw_bencode_equal(const raw_bencode& left, const raw_bencode& right);
+
+template <typename tmpl_raw_object>
+bool raw_bencode_equal(const tmpl_raw_object& left, const char* right, size_t right_size);
+
+template <typename tmpl_raw_object>
+bool raw_bencode_equal_c_str(const tmpl_raw_object& left, const char* right);
+```
+
+These functions compare raw bencode objects using `memcmp` without parsing. They are useful for key lookups in a raw map without creating `std::string` temporaries.
+
+```cpp
+// Check if a raw_string equals a literal without allocating:
+torrent::raw_string key = /* ... */;
+if (torrent::raw_bencode_equal_c_str(key, "info")) {
+    // matched the "info" key
+}
+```

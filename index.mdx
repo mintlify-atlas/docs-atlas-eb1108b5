@@ -1,97 +1,67 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "libTorrent: High-Performance BitTorrent Library"
+description: "libTorrent is a C++ BitTorrent library for *nix systems with zero-copy I/O, DHT support, and a clean API for embedding in torrent clients."
 ---
 
-## Setting up
+libTorrent is a C++ BitTorrent library built for performance and correctness. It transfers data directly from memory-mapped file pages to the network stack, eliminating unnecessary copies. The library is designed to be embedded in torrent clients—[rTorrent](https://github.com/rakshasa/rtorrent) uses it as its core engine.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Build & Install" icon="hammer" href="/building">
+    Compile libTorrent from source on Linux and other *nix systems
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Initialize the library and start your first download in C++
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="book" href="/concepts/download-lifecycle">
+    Understand download states, chunk management, and peer connections
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/torrent-namespace">
+    Complete reference for all public classes and functions
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What libTorrent provides
 
-Everything you need to create world-class documentation.
+libTorrent gives you the full BitTorrent protocol stack as a linkable C++ library. Your application calls into the library to add downloads, manage peers, and respond to events—the library handles the rest.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Zero-copy I/O" icon="bolt">
+    Uses `mmap` to transfer file data directly to sockets without intermediate copies
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="DHT support" icon="network-wired">
+    Full Kademlia DHT for trackerless peer discovery on the BitTorrent network
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Bandwidth throttling" icon="gauge">
+    Per-download and global upload/download throttles with per-address overrides
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Protocol encryption" icon="lock">
+    MSE/PE encryption with automatic plaintext fallback and retry logic
   </Card>
-</Columns>
+  <Card title="Resume data" icon="floppy-disk">
+    Save and restore download state across restarts using built-in resume support
+  </Card>
+  <Card title="Multi-threaded" icon="microchip">
+    Separate main, network, and tracker threads for non-blocking operation
+  </Card>
+</CardGroup>
 
-## Need inspiration?
+## Get started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Build the library">
+    Install build dependencies, run `autoreconf -ivf`, then `./configure && make && make install`. See [Building libTorrent](/building) for details.
+  </Step>
+  <Step title="Initialize in your application">
+    Call `torrent::initialize_main_thread()` followed by `torrent::initialize()` at startup. These set up the thread infrastructure and internal managers.
+  </Step>
+  <Step title="Add a download">
+    Parse a `.torrent` file into a `torrent::Object`, then call `torrent::download_add()` to create a `Download` handle. Call `open()`, then `hash_check()`, then `start()`.
+  </Step>
+  <Step title="Run the event loop">
+    Drive the library by calling `torrent::this_thread::poll()->do_poll(timeout_usec)` in your main loop. The library calls your registered callbacks as events occur.
+  </Step>
+</Steps>
+
+<Note>
+  libTorrent is a library, not a standalone application. You embed it in your own C++ program. [rTorrent](https://github.com/rakshasa/rtorrent) is the reference client implementation.
+</Note>

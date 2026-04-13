@@ -1,0 +1,346 @@
+---
+title: "FileList — iterating and querying torrent file entries"
+description: "Reference for FileList, FileListIterator, and Path: per-file metadata, chunk accounting, root directory control, and directory-aware torrent iteration."
+---
+
+`FileList` is the ordered collection of `File` objects for a torrent. You access it through `Download::file_list()`. The class exposes STL-compatible iteration, aggregate size and chunk counts, root directory control, and utility methods for splitting or merging file entries. It also owns the download's completion bitfield.
+
+<Note>
+  `FileList` inherits from `std::vector<std::unique_ptr<File>>` with a restricted interface. Only the methods listed below are accessible from outside the library.
+</Note>
+
+## Accessing FileList
+
+```cpp
+#include <torrent/data/file_list.h>
+
+torrent::Download dl = /* ... */;
+torrent::FileList& fl = *dl.file_list();
+```
+
+## Type aliases
+
+```cpp
+using base_type  = std::vector<std::unique_ptr<File>>;
+using path_list  = std::vector<std::string>;
+using split_type = std::tuple<uint64_t, Path, int>;  // (size, path, flags)
+
+using iterator_range = std::pair<iterator, iterator>;
+
+// Inherited from base_type:
+using value_type             = std::unique_ptr<File>;
+using iterator               = base_type::iterator;
+using const_iterator         = base_type::const_iterator;
+using reverse_iterator       = base_type::reverse_iterator;
+using const_reverse_iterator = base_type::const_reverse_iterator;
+```
+
+## State queries
+
+```cpp
+bool is_open() const;           // true after the torrent has been opened
+bool is_done() const;           // true when completed_chunks() == size_chunks()
+bool is_valid_piece(const Piece& piece) const;
+bool is_root_dir_created() const;
+bool is_multi_file() const;     // true even for single-file torrents stored as multi-file
+void set_multi_file(bool state);
+```
+
+`is_multi_file()` reflects whether the torrent's metadata declares a multi-file layout. A torrent with a single file can still return `true` here if the `.torrent` file uses the multi-file structure.
+
+## Size and chunk accounting
+
+```cpp
+size_t   size_files() const;    // number of File entries
+uint64_t size_bytes() const;    // total torrent size in bytes
+uint32_t size_chunks() const;   // total number of chunks (from bitfield)
+
+uint32_t completed_chunks() const;  // chunks with verified data
+uint64_t completed_bytes() const;   // approximate bytes received
+uint64_t left_bytes() const;        // bytes remaining to download
+
+uint32_t chunk_size() const;                        // fixed chunk size in bytes
+uint32_t chunk_index_size(uint32_t index) const;    // actual size of chunk at index (last chunk may differ)
+uint64_t chunk_index_position(uint32_t index) const;// byte offset of chunk = index * chunk_size()
+```
+
+<Tip>
+  The last chunk is often smaller than `chunk_size()`. Always use `chunk_index_size(index)` when you need the actual byte count for a specific chunk.
+</Tip>
+
+## Bitfield access
+
+```cpp
+const download_data* data() const;
+const Bitfield*      bitfield() const; // completion bitfield, one bit per chunk
+```
+
+The `Bitfield` returned by `bitfield()` has one bit per chunk. A set bit means that chunk has been downloaded and hash-verified. You can use it to build piece availability maps or determine which chunks still need downloading.
+
+```cpp
+const torrent::Bitfield* bf = fl.bitfield();
+for (uint32_t i = 0; i < fl.size_chunks(); ++i) {
+    if (bf->get(i)) {
+        // chunk i is complete
+    }
+}
+```
+
+## Root directory
+
+```cpp
+const std::string& root_dir() const;
+const std::string& frozen_root_dir() const;
+void               set_root_dir(const std::string& path);
+```
+
+`root_dir()` is the current working root for the torrent's files on disk. Call `set_root_dir()` before opening the torrent; after that point all file paths are resolved relative to this directory. `frozen_root_dir()` is the value that was set when the torrent was opened and does not change.
+
+## Max file size
+
+```cpp
+uint64_t max_file_size() const;
+void     set_max_file_size(uint64_t size);
+```
+
+Limits the maximum size of any individual file within the torrent. The default is `~uint64_t()` (unlimited). Setting this before the torrent opens restricts how large any one file entry can grow.
+
+## Disk space
+
+```cpp
+uint64_t         free_diskspace() const;
+const path_list* indirect_links() const;
+```
+
+`free_diskspace()` returns the smallest free-space value across all volumes touched by the torrent's files. If any files span volumes via symlinks, those volumes are also checked. `indirect_links()` returns the list of directory paths (including the root) that may reside on separate volumes.
+
+## Iteration
+
+`FileList` exposes the standard bidirectional iteration interface. Dereference an iterator to obtain a `const std::unique_ptr<File>&`; call `.get()` to retrieve the raw `File*`.
+
+```cpp
+for (auto& file_ptr : fl) {
+    const torrent::File* file = file_ptr.get();
+    std::cout << file->frozen_path()
+              << " (" << file->size_bytes() << " bytes)\n";
+}
+
+// Or with explicit iterators:
+for (auto it = fl.begin(); it != fl.end(); ++it) {
+    torrent::File* file = it->get();
+    // ...
+}
+
+// Random access:
+torrent::File* first = fl.at(0).get();
+torrent::File* back  = fl.back().get();
+```
+
+## Splitting and merging files
+
+These methods let you restructure the file list, for example when implementing selective downloading by splitting a large file into smaller virtual entries.
+
+```cpp
+// Split the file at 'position' into multiple segments described by [first, last).
+// The sizes in the split_type range must sum to the size of the file being split.
+iterator_range split(iterator position, split_type* first, split_type* last);
+
+// Merge the files in [first, last) into a single file with the given path.
+iterator merge(iterator first, iterator last, const Path& path);
+iterator merge(iterator_range range, const Path& path);
+```
+
+```cpp
+// Rebuild path metadata after path components have changed:
+void update_paths(iterator first, iterator last);
+
+// Create directories on disk:
+bool make_root_path();  // create only the root directory
+bool make_all_paths();  // create all directories needed by every file
+```
+
+---
+
+## FileListIterator
+
+`FileListIterator` provides directory-aware traversal of a `FileList`, tracking the current nesting depth so you can reconstruct the torrent's directory tree as you iterate.
+
+```cpp
+#include <torrent/data/file_list_iterator.h>
+```
+
+### Type aliases
+
+```cpp
+using iterator  = FileList::iterator;
+using reference = File*;
+using pointer   = File**;
+```
+
+### Constructor
+
+```cpp
+explicit FileListIterator(iterator pos, uint32_t depth = 0);
+```
+
+### State queries
+
+```cpp
+bool     is_file() const;     // current entry is a file (not a dir boundary)
+bool     is_empty() const;    // current entry is an empty directory
+bool     is_entering() const; // iterator is at a directory-enter boundary
+bool     is_leaving() const;  // iterator is at a directory-leave boundary
+uint32_t depth() const;       // current nesting depth (absolute value of internal counter)
+```
+
+### Accessors
+
+```cpp
+iterator  base() const; // underlying FileList iterator
+reference file() const; // File* for the current entry (file()->get())
+```
+
+### Navigation
+
+```cpp
+FileListIterator& operator++();   // advance to next entry (depth-aware)
+FileListIterator& operator--();   // step back
+FileListIterator  operator++(int);
+FileListIterator  operator--(int);
+
+FileListIterator& forward_current_depth();  // skip to next entry at same depth
+FileListIterator& backward_current_depth(); // step back to previous at same depth
+```
+
+### Equality
+
+```cpp
+friend bool operator==(const FileListIterator& left, const FileListIterator& right);
+friend bool operator!=(const FileListIterator& left, const FileListIterator& right);
+```
+
+Two `FileListIterator` instances are equal when both their underlying position and depth are equal.
+
+---
+
+## file_list_collapsed_iterator
+
+`file_list_collapsed_iterator` wraps `FileListIterator` and advances by whole directory subtrees rather than individual entries. Each `operator++` jumps to the next sibling at the same directory depth, collapsing subdirectories.
+
+```cpp
+file_list_collapsed_iterator() = default;
+explicit file_list_collapsed_iterator(iterator pos, uint32_t depth = 0);
+file_list_collapsed_iterator(const FileListIterator& src);
+```
+
+It exposes the same `is_file()`, `is_empty()`, `is_entering()`, `is_leaving()`, `depth()`, and `file()` methods as `FileListIterator`.
+
+```cpp
+this_type& operator++(); // forward_current_depth()
+this_type& operator--(); // backward_current_depth()
+```
+
+---
+
+## Path class
+
+`Path` represents a file's path as an ordered sequence of string components (directory names followed by a filename). It inherits from `std::vector<std::string>` with a restricted interface.
+
+```cpp
+#include <torrent/path.h>
+```
+
+### Exposed interface
+
+```cpp
+// Container operations (from std::vector):
+bool        empty() const;
+size_type   size() const;
+void        clear();
+void        reserve(size_type n);
+void        push_back(const std::string& component);
+
+// Element access:
+reference         front();
+const_reference   front() const;
+reference         back();
+const_reference   back() const;
+reference         at(size_type i);
+const_reference   at(size_type i) const;
+reference         operator[](size_type i);
+const_reference   operator[](size_type i) const;
+
+// Iteration:
+iterator               begin();
+iterator               end();
+const_iterator         begin() const;
+const_iterator         end() const;
+reverse_iterator       rbegin();
+reverse_iterator       rend();
+const_reverse_iterator rbegin() const;
+const_reverse_iterator rend() const;
+
+// Path-specific:
+void        insert_path(iterator pos, const std::string& path);
+std::string as_string() const;  // returns components joined with '/'
+
+// Encoding hint:
+std::string encoding() const;
+void        set_encoding(const std::string& enc);
+
+// Access as base vector:
+base_type*       base();
+const base_type* base() const;
+```
+
+`as_string()` joins all components with `/` without a trailing or leading separator. For example, a `Path` with components `{"subdir", "file.txt"}` returns `"subdir/file.txt"`.
+
+```cpp
+const torrent::Path* p = file->path();
+
+// Print each component:
+for (const std::string& component : *p) {
+    std::cout << component << " / ";
+}
+
+// Or as a single string:
+std::cout << p->as_string() << "\n";
+```
+
+---
+
+## TransferList
+
+`TransferList` tracks in-progress chunk downloads as a vector of `BlockList*` pointers. You access it through the download object rather than through `FileList` directly.
+
+```cpp
+#include <torrent/data/transfer_list.h>
+```
+
+### Type aliases
+
+```cpp
+using base_type           = std::vector<BlockList*>;
+using completed_list_type = std::vector<std::pair<int64_t, uint32_t>>;
+```
+
+### Key public methods
+
+```cpp
+// Search:
+iterator       find(uint32_t index);       // find BlockList for chunk index
+const_iterator find(uint32_t index) const;
+
+// Statistics:
+const completed_list_type& completed_list() const; // (timestamp, chunk_index) pairs
+uint32_t succeeded_count() const; // chunks that passed hash verification
+uint32_t failed_count() const;    // chunks that failed hash verification
+
+// Iteration (from std::vector):
+iterator  begin(); iterator  end();
+bool      empty(); size_t    size();
+```
+
+<Note>
+  The modification methods (`insert`, `erase`, `finished`, `hash_succeeded`, `hash_failed`) are internal to libTorrent and not part of the public API surface.
+</Note>

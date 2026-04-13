@@ -1,0 +1,230 @@
+---
+title: "Integrating with Torrent Trackers"
+description: "Inspect, enable, and control HTTP, UDP, and DHT trackers for a download using libTorrent's TrackerControllerWrapper and Tracker APIs."
+---
+
+libTorrent abstracts all tracker communication behind a `TrackerControllerWrapper` associated with each download. Through it you can iterate trackers, check their status, enable or disable individual ones, and trigger manual announces. This page covers the full tracker API surface.
+
+## Tracker types
+
+Every tracker belongs to one of four types defined in `tracker_enum`:
+
+```cpp
+enum tracker_enum {
+  TRACKER_NONE,  // placeholder / not yet determined
+  TRACKER_HTTP,  // HTTP(S) tracker (BEP-3)
+  TRACKER_UDP,   // UDP tracker (BEP-15)
+  TRACKER_DHT,   // DHT peer discovery (BEP-5)
+};
+```
+
+## Accessing the tracker controller
+
+Obtain the controller from a `Download` handle:
+
+```cpp
+torrent::tracker::TrackerControllerWrapper tc = dl.tracker_controller();
+```
+
+The controller is valid as long as the `Download` is registered. Check before use:
+
+```cpp
+if (!tc.is_valid()) { /* handle error */ }
+```
+
+### Controller state
+
+```cpp
+bool active      = tc.is_active();          // controller is running
+bool requesting  = tc.is_requesting();      // a request is in flight
+bool failure     = tc.is_failure_mode();    // all trackers are failing
+bool promiscuous = tc.is_promiscuous_mode();// requesting from every tier
+
+bool any_active  = tc.has_active_trackers();
+bool any_usable  = tc.has_usable_trackers();
+```
+
+### Iterating trackers
+
+```cpp
+uint32_t count = tc.size();
+
+for (uint32_t i = 0; i < count; ++i) {
+  torrent::tracker::Tracker t = tc.at(i);
+  // inspect t
+}
+```
+
+Use the functional helpers to search or iterate without an index loop:
+
+```cpp
+// Find the first HTTP tracker
+torrent::tracker::Tracker http = tc.find_if([](torrent::tracker::Tracker& t) {
+  return t.type() == torrent::TRACKER_HTTP;
+});
+
+// Print all tracker URLs
+tc.for_each([](torrent::tracker::Tracker& t) {
+  std::cout << t.url() << "\n";
+});
+```
+
+## The Tracker class
+
+### Status predicates
+
+```cpp
+bool busy      = t.is_busy();           // request in flight (including scrape)
+bool busy_ns   = t.is_busy_not_scrape();// request in flight, excluding scrape
+bool enabled   = t.is_enabled();
+bool extra     = t.is_extra_tracker();  // added at runtime, not in torrent file
+bool in_use    = t.is_in_use();         // enabled and has had at least one success
+bool usable    = t.is_usable();         // can send a request right now
+bool scrapable = t.is_scrapable();      // supports scrape requests
+```
+
+### Tracker metadata
+
+```cpp
+torrent::tracker_enum type = t.type();
+const std::string& url     = t.url();
+std::string id             = t.tracker_id();  // tracker-assigned ID string
+uint32_t group             = t.group();       // tier (lower = higher priority)
+std::string status_str     = t.status();      // human-readable status
+```
+
+### Enabling and disabling
+
+```cpp
+t.enable();   // allow this tracker to make requests
+t.disable();  // prevent this tracker from making requests
+```
+
+Disabling a tracker does not cancel a request that is already in flight. Use `manual_cancel()` on the download for that.
+
+### Reading tracker state
+
+`TrackerState` is a read-only snapshot of timing and statistics. Access it under a lock because tracker threads may update it concurrently:
+
+```cpp
+t.lock_and_call_state([](const torrent::tracker::TrackerState& s) {
+  uint32_t normal_interval = s.normal_interval();  // seconds between normal announces
+  uint32_t min_interval    = s.min_interval();     // minimum allowed interval
+
+  uint32_t success_last    = s.success_time_last();
+  uint32_t success_next    = s.success_time_next();
+  uint32_t success_count   = s.success_counter();
+
+  uint32_t failed_last     = s.failed_time_last();
+  uint32_t failed_next     = s.failed_time_next();
+  uint32_t failed_count    = s.failed_counter();
+
+  // Scrape data (if tracker supports it)
+  uint32_t complete   = s.scrape_complete();
+  uint32_t incomplete = s.scrape_incomplete();
+  uint32_t downloaded = s.scrape_downloaded();
+
+  // Latest announce response
+  uint32_t new_peers = s.latest_new_peers();
+  uint32_t sum_peers = s.latest_sum_peers();
+});
+```
+
+### TrackerState events
+
+```cpp
+enum event_enum {
+  EVENT_NONE,
+  EVENT_COMPLETED,
+  EVENT_STARTED,
+  EVENT_STOPPED,
+  EVENT_SCRAPE
+};
+
+torrent::tracker::TrackerState::event_enum last_event = s.latest_event();
+```
+
+## Manual tracker control
+
+These methods are called on the `Download`, not on the controller directly:
+
+```cpp
+// Send an immediate announce request
+dl.manual_request(true);   // request right now
+dl.manual_request(false);  // request at next scheduled opportunity
+
+// Cancel the pending request
+dl.manual_cancel();
+
+// Send a 'completed' event to all trackers
+dl.send_completed();
+```
+
+<Note>
+Call `send_completed()` when a torrent finishes downloading. It sends the `event=completed` parameter to all trackers so they can update their seeder counts.
+</Note>
+
+## Timing helpers
+
+The controller exposes convenience methods for scheduling:
+
+```cpp
+uint32_t secs_to_timeout = tc.seconds_to_next_timeout();
+uint32_t secs_to_scrape  = tc.seconds_to_next_scrape();
+```
+
+Use these to schedule callbacks in your event loop instead of polling.
+
+## Adding extra trackers at runtime
+
+You can inject additional trackers not present in the original torrent file:
+
+```cpp
+tc.add_extra_tracker(0, "udp://tracker.example.com:6969/announce");
+```
+
+The first argument is the group (tier) to add the tracker to. Extra trackers are flagged with `is_extra_tracker() == true`.
+
+## Controlling numwant
+
+`numwant` tells the tracker how many peers you want in each response:
+
+```cpp
+int32_t current = tc.numwant();
+tc.set_numwant(50);
+
+// Disable numwant (send no preference)
+tc.set_numwant(torrent::Download::numwanted_diabled);
+```
+
+## Tracker key
+
+The tracker key is a 32-bit integer passed to `download_add` and included in all tracker announces for this download. It allows the tracker to distinguish different instances of the same client and is accessible via the controller:
+
+```cpp
+uint32_t key = tc.key();
+```
+
+Choose a random value per session and persist it alongside your resume data so that trackers can correctly correlate consecutive sessions.
+
+## Waiting before close
+
+When you stop an active download, libTorrent sends a tracker stop event. You can close the download immediately after calling `stop()`, but the tracker will not know you left:
+
+```cpp
+dl.stop();
+// Optionally wait for the stop announce to complete before closing.
+// Check tc.has_active_trackers() in a loop or respond to the tracker signal.
+dl.close();
+```
+
+Connect to the tracker signals on `DownloadInfo` to detect completion:
+
+```cpp
+dl.info()->signal_tracker_success().push_back([]() {
+  // at least one tracker responded successfully
+});
+dl.info()->signal_tracker_failed().push_back([](const std::string& msg) {
+  // all trackers failed with this message
+});
+```

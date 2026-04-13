@@ -1,0 +1,172 @@
+---
+title: "DHT Peer Discovery Without Trackers"
+description: "Set up Kademlia-based DHT in libTorrent to discover peers without a central tracker, including bootstrapping and per-download integration."
+---
+
+libTorrent implements a Kademlia-based Distributed Hash Table (DHT) as defined in [BEP-5](https://www.bittorrent.org/beps/bep_0005.html). DHT lets peers find each other without relying on a central tracker — useful for torrents with dead trackers, private networks, or trackerless magnet links. libTorrent integrates DHT directly into its tracker subsystem: from the perspective of each download, DHT appears as a `TRACKER_DHT` type tracker alongside any HTTP or UDP trackers.
+
+## How libTorrent uses DHT
+
+When a download has a DHT tracker entry (or when you bootstrap the DHT node), libTorrent periodically sends `get_peers` queries to the DHT network for each active download's info-hash. Responses contain peer contact information that libTorrent uses exactly like tracker responses.
+
+The DHT tracker type is:
+
+```cpp
+torrent::tracker_enum type = torrent::TRACKER_DHT;
+```
+
+You can identify DHT trackers in the tracker list using:
+
+```cpp
+dl.tracker_controller().for_each([](torrent::tracker::Tracker& t) {
+  if (t.type() == torrent::TRACKER_DHT) {
+    // this tracker uses DHT
+  }
+});
+```
+
+## Bootstrapping
+
+DHT requires at least one known node to bootstrap from. Without it, the local node cannot find its position in the Kademlia routing table and will remain isolated.
+
+### Adding a bootstrap node by address
+
+Use `dht_add_peer_node` from `<torrent/common.h>` to add a node you already have an address for — for example, from a previous session's DHT cache or from a torrent file's `nodes` key:
+
+```cpp
+#include <torrent/common.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+sockaddr_in addr{};
+addr.sin_family = AF_INET;
+inet_pton(AF_INET, "67.215.246.10", &addr.sin_addr); // router.bittorrent.com
+addr.sin_port = htons(6881);
+
+torrent::runtime::dht_add_peer_node(
+  reinterpret_cast<const sockaddr*>(&addr),
+  6881
+);
+```
+
+<Tip>
+Use well-known public DHT bootstrap nodes (such as `router.bittorrent.com:6881` or `router.utorrent.com:6881`) when starting a fresh session with no cached nodes.
+</Tip>
+
+### Adding a bootstrap node by hostname
+
+Use `DhtController::add_bootstrap_node` when you have a hostname instead of a resolved address. libTorrent resolves the hostname asynchronously:
+
+```cpp
+torrent::tracker::DhtController* dht = /* see below */;
+dht->add_bootstrap_node("router.bittorrent.com", 6881);
+```
+
+## DHT listen port
+
+DHT shares the same listen port as the main BitTorrent protocol. Retrieve it with:
+
+```cpp
+uint16_t port = torrent::runtime::listen_port();
+```
+
+Announce this port in tracker requests and to peers so they can send you DHT messages. The `DhtController` exposes its active port directly as well:
+
+```cpp
+uint16_t dht_port = dht_controller->port();
+```
+
+<Note>
+`listen_port()` and `DhtController::port()` should return the same value under normal operation. Use `listen_port()` for outward-facing announcements.
+</Note>
+
+## Accessing DhtController
+
+`DhtController` lives in `<torrent/tracker/dht_controller.h>` and is accessed via the tracker subsystem. You typically obtain a pointer to it through libTorrent's internal routing rather than constructing one yourself:
+
+```cpp
+#include <torrent/tracker/dht_controller.h>
+
+torrent::tracker::DhtController* dht = /* obtained from your integration layer */;
+
+bool active   = dht->is_active();
+bool valid    = dht->is_valid();
+bool incoming = dht->is_receiving_requests();
+
+dht->set_receive_requests(true);   // accept incoming DHT queries
+```
+
+## Starting and stopping DHT
+
+```cpp
+bool started = dht->start();  // returns false if already active or invalid
+dht->stop();
+```
+
+DHT must be started before `download_add` for new downloads to automatically register DHT lookups.
+
+## Persisting DHT state
+
+DHT maintains a routing table that takes time to populate. Save it between sessions to resume quickly:
+
+```cpp
+// Save to an Object container (you control the Object's lifetime)
+torrent::Object cache;
+dht->store_cache(&cache);  // fills cache with DHT node data
+
+// Restore at next startup
+dht->initialize(cache);
+```
+
+`store_cache` returns the same pointer you pass in. Use `object_write_bencode` to serialise the cache to disk (see the [Bencode guide](/guides/bencode)).
+
+## DHT statistics
+
+```cpp
+torrent::tracker::DhtController::statistics_type stats = dht->get_statistics();
+
+// Routing table health
+unsigned int nodes   = stats.num_nodes;
+unsigned int buckets = stats.num_buckets;
+
+// Network activity
+unsigned int sent     = stats.queries_sent;
+unsigned int received = stats.replies_received;
+unsigned int errors   = stats.errors_received;
+
+// Per-torrent peer cache
+unsigned int peers    = stats.num_peers;
+unsigned int trackers = stats.num_trackers;
+
+// Bootstrap state: 0=inactive, 1=bootstrapping, 2+=normal
+unsigned int cycle = stats.cycle;
+```
+
+Reset counters without restarting DHT:
+
+```cpp
+dht->reset_statistics();
+```
+
+## Integration checklist
+
+<Steps>
+  <Step title="Configure the listen port">
+    Ensure `torrent::runtime::listen_port()` returns a valid port before starting DHT. The port must be reachable for incoming DHT queries.
+  </Step>
+  <Step title="Restore cached nodes">
+    Call `dht->initialize(cache)` with your persisted DHT cache before `dht->start()`. If no cache exists, pass an empty `Object`.
+  </Step>
+  <Step title="Start the DHT controller">
+    Call `dht->start()`. Returns `false` if DHT is already running or the controller is invalid.
+  </Step>
+  <Step title="Add bootstrap nodes">
+    Add at least one bootstrap node via `torrent::runtime::dht_add_peer_node()` or `dht->add_bootstrap_node()`. DHT will not find peers until the routing table is populated.
+  </Step>
+  <Step title="Add downloads normally">
+    Use `download_add` as usual. Downloads with DHT entries in their metadata will automatically use DHT for peer discovery.
+  </Step>
+  <Step title="Persist DHT state on shutdown">
+    Before calling `torrent::cleanup()`, call `dht->store_cache(&cache)` and write the cache to disk.
+  </Step>
+</Steps>

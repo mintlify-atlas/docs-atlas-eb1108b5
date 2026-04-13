@@ -1,0 +1,136 @@
+---
+title: "Chunk Management and Memory Mapping"
+description: "Learn how libTorrent maps torrent pieces into memory, controls memory limits, tunes sync behaviour, and preloads chunks for smooth streaming."
+---
+
+libTorrent divides every torrent into fixed-size **chunks** (pieces) and maps them directly into virtual memory using `mmap`. The `ChunkManager` class is the global authority over how much memory these mappings consume, when dirty chunks are synced to disk, and whether upcoming chunks are preloaded into the page cache before they are needed.
+
+Access the singleton instance via:
+
+```cpp
+torrent::ChunkManager* cm = torrent::chunk_manager();
+```
+
+## Memory limits
+
+By default `ChunkManager` sets its limit to **4/5 of the estimated available memory**, capped at 1 GB. You can read the static helper to see the cap before construction:
+
+```cpp
+uint64_t ceiling = torrent::ChunkManager::estimate_max_memory_usage(); // ≤ 1 GB
+
+uint64_t current_limit = cm->max_memory_usage();
+cm->set_max_memory_usage(512ULL * 1024 * 1024); // cap at 512 MB
+```
+
+Monitor live usage with:
+
+```cpp
+uint64_t mapped     = cm->memory_usage();        // bytes currently mmap'd
+uint32_t num_blocks = cm->memory_block_count();  // number of mapped blocks
+uint64_t in_queue   = cm->sync_queue_memory_usage(); // bytes awaiting sync
+uint32_t queue_len  = cm->sync_queue_size();         // chunks in sync queue
+```
+
+When memory pressure is high, ask the manager to evict mappings immediately:
+
+```cpp
+cm->try_free_memory(64ULL * 1024 * 1024); // try to free 64 MB
+```
+
+## Allocating and deallocating quota
+
+`ChunkList` (the per-download chunk table) calls these methods internally to book and release memory quota. Client code may call them when it maps additional memory of its own so the library accounts for it correctly.
+
+```cpp
+// Allocate quota for 'size' bytes.
+// Returns false if the request would exceed max_memory_usage().
+bool ok = cm->allocate(chunk_size);
+
+// Allocate without writing to the log.
+bool ok = cm->allocate(chunk_size, torrent::ChunkManager::allocate_dont_log);
+
+// Release quota, reversing a previous log entry.
+cm->deallocate(chunk_size, torrent::ChunkManager::allocate_revert_log);
+```
+
+| Flag | Value | Meaning |
+|------|-------|---------|
+| `allocate_revert_log` | `1 << 0` | Remove the matching allocation log entry when deallocating. |
+| `allocate_dont_log`   | `1 << 1` | Skip writing an allocation entry to the log. |
+
+<Note>
+  If `allocate()` returns `false` due to an error unrelated to the quota, you must call `deallocate()` with `allocate_revert_log` **within the same call context** so the log stays consistent.
+</Note>
+
+## Sync behaviour
+
+Dirty chunks are not flushed to disk immediately. The manager waits until a chunk has been idle for `timeout_sync` seconds (default **600 s**) before syncing it, giving the kernel room to batch writes. The safer `timeout_safe_sync` (default **900 s**) is used when `safe_sync` is enabled.
+
+```cpp
+cm->set_timeout_sync(300);       // flush after 5 minutes of inactivity
+cm->set_timeout_safe_sync(450);  // safe-sync after 7.5 minutes
+
+bool is_safe = cm->safe_sync();
+cm->set_safe_sync(true);
+```
+
+Call `periodic_sync()` to trigger a sync pass on the current queue. libTorrent calls this automatically at regular intervals; you normally do not need to call it directly.
+
+```cpp
+cm->periodic_sync();
+```
+
+## Preloading
+
+Preloading reads ahead into the kernel page cache so that peers can be served without stalling on disk I/O. It is disabled by default (`preload_type == 0`).
+
+```cpp
+// Enable preloading (non-zero value).
+cm->set_preload_type(1);
+
+// Minimum chunk size before attempting a preload (default 256 KB).
+cm->set_preload_min_size(512 * 1024);
+
+// Minimum transfer rate per whole MB of chunk size required
+// before a preload is triggered (default 5 KB/s per MB).
+cm->set_preload_required_rate(8 * 1024);
+```
+
+Setting `preload_type` back to `0` disables preloading:
+
+```cpp
+cm->set_preload_type(0); // disable
+```
+
+## Preload statistics
+
+Track how often preloading succeeds to tune `preload_required_rate`:
+
+```cpp
+uint32_t hits   = cm->stats_preloaded();      // chunks that were preloaded
+uint32_t misses = cm->stats_not_preloaded();  // chunks that were not preloaded
+```
+
+These counters are incremented by the library and are read-only from client code (no reset API is exposed).
+
+<Tip>
+  A high `stats_not_preloaded` count relative to `stats_preloaded` usually means `preload_required_rate` is too high for your workload. Lower the value to allow preloading at slower transfer rates.
+</Tip>
+
+## Recommended setup
+
+```cpp
+torrent::ChunkManager* cm = torrent::chunk_manager();
+
+// Allow up to 512 MB of mapped chunks.
+cm->set_max_memory_usage(512ULL * 1024 * 1024);
+
+// Sync dirty chunks after 5 minutes idle.
+cm->set_timeout_sync(300);
+cm->set_timeout_safe_sync(450);
+
+// Enable preloading for uploads faster than ~20 KB/s per MB of chunk.
+cm->set_preload_type(1);
+cm->set_preload_min_size(256 * 1024);
+cm->set_preload_required_rate(20 * 1024);
+```

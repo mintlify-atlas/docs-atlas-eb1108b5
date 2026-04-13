@@ -1,122 +1,102 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "libTorrent",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#41b1f8",
+    "light": "#042b93",
+    "dark": "#cee4f4"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "https://media.brand.dev/0a68ee99-69c3-44c1-9ad7-847af0d8adfd.png",
+  "logo": {
+    "light": "https://media.brand.dev/94d38b97-1127-4688-ba9b-7d1c2e22c545.svg",
+    "dark": "https://media.brand.dev/94d38b97-1127-4688-ba9b-7d1c2e22c545.svg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/rakshasa/libtorrent"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/rakshasa/libtorrent"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
-              "quickstart",
-              "development"
+              "introduction",
+              "building",
+              "quickstart"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "concepts/download-lifecycle",
+              "concepts/chunk-management",
+              "concepts/peer-connections",
+              "concepts/throttling"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Guides",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "guides/managing-downloads",
+              "guides/file-management",
+              "guides/tracker-integration",
+              "guides/dht",
+              "guides/bencode"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Advanced",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "advanced/threading-model",
+              "advanced/network-configuration",
+              "advanced/error-handling",
+              "advanced/performance-tuning"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "API Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Library",
             "pages": [
-              "api-reference/introduction"
+              "api/torrent-namespace",
+              "api/download",
+              "api/download-info"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Data & Files",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "api/file",
+              "api/file-list",
+              "api/chunk-manager",
+              "api/object-bencode"
+            ]
+          },
+          {
+            "group": "Networking",
+            "pages": [
+              "api/connection-manager",
+              "api/peer",
+              "api/tracker",
+              "api/throttle"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

@@ -1,0 +1,202 @@
+---
+title: "ConnectionManager — Socket, Filter, and Throttle Control"
+description: "Configure global connection limits, per-address filtering, and per-address throttle assignment for all peer sockets in libTorrent."
+---
+
+`ConnectionManager` controls how many peer sockets libTorrent may open at any one time, which addresses are allowed to connect, and which throttle pair each address receives. You obtain the singleton instance by calling `torrent::connection_manager()` after `torrent::initialize()`. The manager is not copyable; always access it through the pointer.
+
+```cpp
+#include <torrent/torrent.h>
+#include <torrent/connection_manager.h>
+
+torrent::ConnectionManager* cm = torrent::connection_manager();
+```
+
+---
+
+## Type definitions
+
+```cpp
+namespace torrent {
+
+using ThrottlePair = std::pair<Throttle*, Throttle*>;
+//  .first  = upload throttle
+//  .second = download throttle
+
+class ConnectionManager {
+public:
+  using size_type         = uint32_t;
+  using port_type         = uint16_t;
+  using slot_filter_type   = std::function<uint32_t(const sockaddr*)>;
+  using slot_throttle_type = std::function<ThrottlePair(const sockaddr*)>;
+};
+
+}
+```
+
+| Alias | Underlying type | Notes |
+|---|---|---|
+| `size_type` | `uint32_t` | Used for socket counts and limits. |
+| `port_type` | `uint16_t` | Represents TCP/UDP port numbers. |
+| `slot_filter_type` | `std::function<uint32_t(const sockaddr*)>` | Filter callback; return `0` to allow, non-zero to deny. |
+| `slot_throttle_type` | `std::function<ThrottlePair(const sockaddr*)>` | Throttle assignment callback; return `{nullptr, nullptr}` to use the global default. |
+| `ThrottlePair` | `std::pair<Throttle*, Throttle*>` | Defined in `connection_manager.h`; first = upload, second = download. |
+
+---
+
+## Socket count
+
+These methods track the number of currently open peer sockets and enforce the configured maximum.
+
+```cpp
+namespace torrent {
+
+class ConnectionManager {
+public:
+  bool      can_connect() const;
+
+  void      inc_socket_count();
+  void      dec_socket_count();
+
+  size_type size()     const;
+  size_type max_size() const;
+  void      set_max_size(size_type s);
+};
+
+}
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `can_connect() const` | `bool` | Returns `true` when `size() < max_size()` and the filter (if set) does not block the address. Call this before initiating each outgoing connection. |
+| `inc_socket_count()` | `void` | Increments the tracked count of open sockets. Call after successfully opening a connection. |
+| `dec_socket_count()` | `void` | Decrements the tracked count. Call when a socket is closed. |
+| `size() const` | `size_type` | Current number of open sockets as tracked by `inc`/`dec`. |
+| `max_size() const` | `size_type` | Upper limit set by `set_max_size`. Zero means no limit has been configured. |
+| `set_max_size(size_type s)` | `void` | Sets the maximum number of concurrent open sockets. |
+
+<Warning>
+  `inc_socket_count()` and `dec_socket_count()` do not open or close sockets themselves. You are responsible for calling them at the right points so that `size()` stays accurate.
+</Warning>
+
+---
+
+## Filter slot
+
+The filter slot lets you deny individual addresses before a connection is established. When no filter is set, all addresses are permitted.
+
+```cpp
+namespace torrent {
+
+class ConnectionManager {
+public:
+  uint32_t filter(const sockaddr* sa);
+  void     set_filter(const slot_filter_type& s);
+};
+
+}
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `filter(const sockaddr* sa)` | `uint32_t` | Invokes the registered filter function for `sa`. Returns `0` when no filter is set (allow). |
+| `set_filter(const slot_filter_type& s)` | `void` | Registers a filter callback. The callback receives the remote address and must return `0` to allow or a non-zero reason code to deny. |
+
+<Note>
+  A non-zero return value from your filter function blocks the connection. The specific value is not interpreted by libTorrent — you may use it as a bitmask of denial reasons for your own logging.
+</Note>
+
+**Example: block a specific subnet**
+
+```cpp
+torrent::connection_manager()->set_filter([](const sockaddr* sa) -> uint32_t {
+  if (sa->sa_family == AF_INET) {
+    auto* sin = reinterpret_cast<const sockaddr_in*>(sa);
+    uint32_t ip = ntohl(sin->sin_addr.s_addr);
+    // Block 10.0.0.0/8
+    if ((ip >> 24) == 10)
+      return 1;
+  }
+  return 0;
+});
+```
+
+---
+
+## Address throttle slot
+
+The address throttle slot lets you assign a custom `ThrottlePair` to each connecting address. This is the mechanism for per-peer or per-subnet bandwidth shaping.
+
+```cpp
+namespace torrent {
+
+class ConnectionManager {
+public:
+  slot_throttle_type& address_throttle();
+};
+
+}
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `address_throttle()` | `slot_throttle_type&` | Returns a mutable reference to the throttle-assignment callback. Assign a callable that maps a `sockaddr*` to a `ThrottlePair`. |
+
+<Tip>
+  Return `ThrottlePair{nullptr, nullptr}` from your callback to fall back to the global upload/download throttles for that address.
+</Tip>
+
+**Example: assign a dedicated throttle to one address**
+
+```cpp
+torrent::Throttle* special_up   = torrent::Throttle::create_throttle();
+torrent::Throttle* special_down = torrent::Throttle::create_throttle();
+special_up->set_max_rate(512 * 1024);    // 512 KB/s upload cap
+special_down->set_max_rate(1024 * 1024); // 1 MB/s download cap
+
+torrent::connection_manager()->address_throttle() =
+  [=](const sockaddr* sa) -> torrent::ThrottlePair {
+    if (is_my_special_peer(sa))
+      return {special_up, special_down};
+    return {nullptr, nullptr};
+  };
+```
+
+---
+
+## Handshake state constants
+
+These integer constants are defined inside `ConnectionManager` and describe the outcome of a peer handshake. You may encounter them in handshake event callbacks.
+
+```cpp
+namespace torrent {
+
+class ConnectionManager {
+public:
+  enum {
+    handshake_incoming           = 1,
+    handshake_outgoing           = 2,
+    handshake_outgoing_encrypted = 3,
+    handshake_outgoing_proxy     = 4,
+    handshake_success            = 5,
+    handshake_dropped            = 6,
+    handshake_failed             = 7,
+    handshake_retry_plaintext    = 8,
+    handshake_retry_encrypted    = 9
+  };
+};
+
+}
+```
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `handshake_incoming` | `1` | Handshake initiated by a remote peer connecting to us. |
+| `handshake_outgoing` | `2` | Handshake initiated by us to a remote peer, plaintext. |
+| `handshake_outgoing_encrypted` | `3` | Outgoing handshake using MSE/PE encryption. |
+| `handshake_outgoing_proxy` | `4` | Outgoing handshake routed through a proxy. |
+| `handshake_success` | `5` | Handshake completed successfully. |
+| `handshake_dropped` | `6` | Handshake was dropped (e.g. connection limit reached). |
+| `handshake_failed` | `7` | Handshake failed due to a protocol error. |
+| `handshake_retry_plaintext` | `8` | Handshake retried without encryption. |
+| `handshake_retry_encrypted` | `9` | Handshake retried with encryption. |

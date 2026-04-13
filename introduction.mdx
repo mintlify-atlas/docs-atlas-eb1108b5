@@ -1,0 +1,61 @@
+---
+title: "What is libTorrent? C++ BitTorrent Library Overview"
+description: "libTorrent is a GPL-2.0 C++ BitTorrent library for *nix that delivers high throughput via zero-copy mmap I/O and a clean embedding API."
+---
+
+libTorrent is a BitTorrent protocol library written in C++ for \*nix systems. Rather than copying data through intermediate buffers, it transfers file pages directly from memory-mapped storage to the network stack—eliminating redundant memory copies and keeping CPU overhead low. You embed libTorrent in your own application and call its API to manage downloads, peers, and protocol events. [rTorrent](https://github.com/rakshasa/rtorrent), the popular ncurses torrent client, is built on top of it.
+
+<CardGroup cols={2}>
+  <Card title="Building libTorrent" icon="hammer" href="/building">
+    Install dependencies, compile from source, and verify your installation
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Initialize the library and start your first download in C++
+  </Card>
+  <Card title="Download lifecycle" icon="arrow-progress" href="/concepts/download-lifecycle">
+    Understand how downloads move through open, hash-check, and active states
+  </Card>
+  <Card title="API reference" icon="code" href="/api/torrent-namespace">
+    Complete reference for all public functions in the torrent namespace
+  </Card>
+</CardGroup>
+
+## Key features
+
+- **Zero-copy I/O** — uses `mmap` to send file data directly to sockets without intermediate buffers
+- **DHT support** — full Kademlia DHT for trackerless peer discovery
+- **Bandwidth throttling** — global and per-download upload/download throttles
+- **Protocol encryption** — MSE/PE encryption with automatic plaintext fallback
+- **Resume data** — save and restore download state across restarts using built-in bencode serialization
+- **Multi-threaded** — separate main, network, and tracker threads for non-blocking operation
+- **epoll / kqueue** — uses the platform's most efficient poll mechanism automatically
+
+## Design philosophy
+
+libTorrent is designed to be a backend, not a standalone program. The library exposes a C++ API that your application drives: you add torrents, configure limits, and respond to signals. The library handles all protocol state. This separation keeps the API surface clean and lets you build any user interface on top—CLI, ncurses, GUI, or daemon.
+
+The zero-copy architecture is the defining performance characteristic. On Linux, data flows from disk pages through `mmap` directly into kernel socket buffers. On other \*nix platforms the same path is preserved wherever the OS supports it. This means libTorrent's throughput scales with your network and disk, not with CPU memory bandwidth.
+
+## Version and identification
+
+The current release is **0.16.9**. When connecting to peers, libTorrent identifies itself with the peer name `-lt1009-` and the 4-byte DHT client identifier `lt\x10\x09`.
+
+You can read the compiled version string at runtime:
+
+```cpp
+#include <torrent/torrent.h>
+
+const char* ver = torrent::version();
+```
+
+## License and platforms
+
+libTorrent is released under the **GPL-2.0** license. It targets \*nix platforms—Linux, macOS, and BSDs. Your compiler must support **C++17**; the build system enforces this with `AX_CXX_COMPILE_STDCXX(17, noext, mandatory)`.
+
+## Relationship to rTorrent
+
+[rTorrent](https://github.com/rakshasa/rtorrent) is the reference client application that uses libTorrent as its core engine. If you want a ready-to-run torrent client rather than a library to embed, rTorrent is the place to start. If you want to build your own client or integrate BitTorrent support into an existing application, libTorrent gives you the protocol stack.
+
+<Note>
+  libTorrent is a library, not a standalone application. You must write a host program that initializes the library, drives the event loop, and handles callbacks. See the [quickstart](/quickstart) for a minimal working example.
+</Note>

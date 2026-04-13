@@ -1,0 +1,153 @@
+---
+title: "Download Lifecycle and States"
+description: "Understand the three states a libTorrent download moves through—Closed, Open, and Active—and how to drive transitions between them."
+---
+
+Every `torrent::Download` object starts in the **Closed** state and progresses through **Open** and **Active** as you call `open()`, run a hash check, and finally `start()`. Understanding these states is essential because certain operations—setting file paths, adjusting the bitfield, applying resume data—are only valid in specific states.
+
+## State overview
+
+| State  | `is_open()` | `is_active()` | `is_hash_checked()` | Description |
+|--------|:-----------:|:-------------:|:-------------------:|-------------|
+| Closed | `false`     | `false`       | `false`             | Initial state. Bitfield cleared, tracker requests closed. |
+| Open   | `true`      | `false`       | `false` (initially) | Files created and open on disk. Ready for hash checking. |
+| Active | `true`      | `true`        | `true`              | Peers can connect and data transfers. |
+
+<Note>
+  File paths can only be changed while a download is in the **Closed** state. Calling `open()` when the download cannot create its files throws `torrent::local_error`.
+</Note>
+
+## State transitions
+
+<Steps>
+  <Step title="Closed → Open: call open()">
+    `open()` creates or opens all files in the download and allocates the internal data structures needed for I/O. Pass `open_enable_fallocate` if you want the library to pre-allocate disk space using `fallocate(2)`.
+
+    ```cpp
+    // Open with optional fallocate pre-allocation.
+    download.open(torrent::Download::open_enable_fallocate);
+
+    // Verify the transition.
+    assert(download.info()->is_open());
+    assert(!download.info()->is_active());
+    ```
+  </Step>
+
+  <Step title="Open → hash checked: call hash_check()">
+    Before a download can go Active, it needs a valid bitfield of completed chunks. Call `hash_check()` to build one. The method returns `true` immediately when the check is complete (or queued).
+
+    ```cpp
+    // tryQuick = true: check only if chunks can be mmap'd.
+    // Returns true when finished (or check was skipped because
+    // all chunks had valid resume data).
+    bool done = download.hash_check(/*tryQuick=*/true);
+    ```
+
+    While checking is in progress:
+
+    ```cpp
+    bool checking = download.is_hash_checking(); // true during async check
+    bool checked  = download.is_hash_checked();  // true when done
+    ```
+
+    <Tip>
+      Use `hash_check(true)` (quick mode) for fast startup. Quick mode stops at the first chunk that requires mmap and queues the remainder asynchronously. If no chunks need mapping it returns `true` right away.
+    </Tip>
+
+    You can stop an in-progress hash check with `hash_stop()`.
+  </Step>
+
+  <Step title="Open + checked → Active: call start()">
+    Once the hash check is complete, call `start()` to connect to peers and begin transferring data.
+
+    ```cpp
+    download.start(); // default flags
+
+    assert(download.info()->is_open());
+    assert(download.info()->is_active());
+    assert(download.is_hash_checked());
+    ```
+  </Step>
+
+  <Step title="Active → Open: call stop()">
+    Stopping a download sends a tracker announce (unless you skip it) and disconnects peers, but leaves files open.
+
+    ```cpp
+    download.stop(); // sends tracker "stopped" event
+
+    // Skip the tracker announce (e.g., on shutdown).
+    download.stop(torrent::Download::stop_skip_tracker);
+    ```
+
+    <Note>
+      You do not have to wait for the tracker request to finish before calling `close()`, but it is recommended so the tracker removes this client from its peer list promptly.
+    </Note>
+  </Step>
+
+  <Step title="Open → Closed: call close()">
+    `close()` releases file handles and clears the bitfield, returning the download to its initial state.
+
+    ```cpp
+    download.close();
+
+    assert(!download.info()->is_open());
+    assert(!download.info()->is_active());
+    ```
+  </Step>
+</Steps>
+
+## Open flags
+
+| Flag | Value | Effect |
+|------|-------|--------|
+| `open_enable_fallocate` | `1 << 0` | Pre-allocate disk space with `fallocate(2)` when creating files. |
+
+## Start flags
+
+| Flag | Value | Effect |
+|------|-------|--------|
+| `start_no_create` | `1 << 1` | Do not create missing files; fail instead. |
+| `start_keep_baseline` | `1 << 2` | Keep the current uploaded/completed baseline counters. |
+| `start_skip_tracker` | `1 << 3` | Skip the initial tracker announce on start. |
+
+## Stop flags
+
+| Flag | Value | Effect |
+|------|-------|--------|
+| `stop_skip_tracker` | `1 << 0` | Skip the "stopped" tracker announce on stop. |
+
+## Connection types
+
+The `ConnectionType` enum controls the peer protocol behaviour for a download:
+
+```cpp
+enum ConnectionType {
+  CONNECTION_LEECH,         // Normal leeching; requests pieces from peers.
+  CONNECTION_SEED,          // Seeding mode; does not request pieces.
+  CONNECTION_INITIAL_SEED,  // Super-seeding: sends only pieces peers don't have.
+  CONNECTION_METADATA,      // Fetches torrent metadata only (magnet links).
+};
+
+download.set_connection_type(torrent::Download::CONNECTION_LEECH);
+ConnectionType current = download.connection_type();
+```
+
+## Resume data and bitfield
+
+Use these methods when restoring a download from saved state. They must be called while the download is **open, not hash-checked, and not currently checking**:
+
+```cpp
+// Mark all chunks as complete (seeder) or all incomplete (fresh start).
+download.set_bitfield(/*allSet=*/true);
+
+// Restore a previously-saved bitfield from raw bytes.
+download.set_bitfield(first_byte_ptr, last_byte_ptr);
+
+// Re-check or clear a specific chunk range.
+download.update_range(torrent::Download::update_range_recheck, first_chunk, last_chunk);
+download.update_range(torrent::Download::update_range_clear,   first_chunk, last_chunk);
+```
+
+<Warning>
+  Calling `set_bitfield()` or `update_range()` on an active or already hash-checked download has undefined behaviour. Always check state first.
+</Warning>

@@ -1,80 +1,239 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Get Started with libTorrent in Your C++ Application"
+description: "Link libTorrent into your C++ application, initialize the library, load a torrent file, and drive the download through its full lifecycle."
 ---
 
-## Get started in three steps
+This guide walks you through embedding libTorrent in a C++ application. You will link the library, initialize its thread infrastructure, parse a `.torrent` file, add a download, and run the event loop. The code samples use the actual public API from `<torrent/torrent.h>` and `<torrent/download.h>`.
 
-Get your documentation site running locally and make your first customization.
+## Step 1: Link the library
 
-### Step 1: Set up your local environment
+Use **pkg-config** to get the correct compiler and linker flags:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash
+pkg-config --cflags --libs libtorrent
+```
 
-### Step 2: Deploy your changes
+In a simple Makefile:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```makefile
+CXXFLAGS += $(shell pkg-config --cflags libtorrent)
+LDFLAGS  += $(shell pkg-config --libs   libtorrent)
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+Or pass the flags directly when compiling a single file:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash
+g++ -std=c++17 main.cpp $(pkg-config --cflags --libs libtorrent) -o mytorrent
+```
 
-### Step 3: Go live
+## Full example
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+The following program shows the complete initialization, download, and teardown sequence. Each numbered section corresponds to a step explained below.
+
+```cpp
+#include <cstdlib>        // srandom, srand48
+#include <ctime>          // time
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+
+#include <torrent/torrent.h>
+#include <torrent/download.h>
+#include <torrent/object_stream.h>
+#include <torrent/exceptions.h>
+
+int main() {
+    // 1. Seed the random number generators before initializing.
+    srandom(time(nullptr));
+    srand48(time(nullptr));
+
+    // 2. Initialize the main thread infrastructure, then the library.
+    torrent::initialize_main_thread();
+    torrent::initialize();
+
+    // 3. Parse the .torrent file into a heap-allocated Object.
+    torrent::Object* meta = new torrent::Object();
+    {
+        std::ifstream ifs("example.torrent");
+        if (!ifs) throw std::runtime_error("cannot open torrent file");
+        ifs >> *meta;   // operator>> calls object_read_bencode internally
+    }
+
+    // 4. Register the download. download_add takes ownership of meta
+    //    on success; on failure, the caller must delete it.
+    torrent::Download dl = torrent::download_add(meta, 0);
+
+    // 5. Open files, verify existing data, then start.
+    dl.open();
+    dl.hash_check(false);   // false = full hash check across all chunks
+    dl.start();
+
+    // 6. Drive the event loop until the download finishes.
+    auto* poll = torrent::this_thread::poll();
+    while (dl.is_valid() && dl.bytes_done() < dl.file_list()->size_bytes()) {
+        poll->do_poll(1000000);   // block up to 1 second (in microseconds)
+    }
+
+    // 7. Stop and close the download, then clean up the library.
+    dl.stop();
+    dl.close();
+    torrent::download_remove(dl);
+    torrent::cleanup();
+
+    return 0;
+}
+```
+
+<Note>
+  This example omits signal handling, error recovery, and tracker callbacks for brevity. A production client should catch `torrent::base_error` subclasses and handle connection or storage failures.
+</Note>
+
+## Steps explained
+
+<Steps>
+  <Step title="Seed random number generators">
+    libTorrent's source comment in `torrent.h` states explicitly: **make sure you seed `srandom` and `srand48` if available** before calling `initialize`. The library uses these for peer ID generation and protocol randomization.
+
+    ```cpp
+    srandom(time(nullptr));
+    srand48(time(nullptr));
+    ```
+  </Step>
+
+  <Step title="Initialize the library">
+    Call `initialize_main_thread()` first to register the calling thread as the main thread, then call `initialize()` to start internal managers:
+
+    ```cpp
+    torrent::initialize_main_thread();
+    torrent::initialize();
+    ```
+
+    Both functions are declared in `<torrent/torrent.h>`:
+
+    ```cpp
+    void initialize_main_thread() LIBTORRENT_EXPORT;
+    void initialize()             LIBTORRENT_EXPORT;
+    ```
+
+    You can confirm the library is ready with `torrent::is_initialized()`.
+  </Step>
+
+  <Step title="Parse the torrent file">
+    Read the `.torrent` file into a `torrent::Object` using the `>>` stream operator from `<torrent/object_stream.h>`. The `Object` must be heap-allocated because `download_add` takes ownership of it:
+
+    ```cpp
+    torrent::Object* meta = new torrent::Object();
+    std::ifstream ifs("example.torrent");
+    ifs >> *meta;   // calls object_read_bencode internally
+    ```
+
+    The stream operator signature is:
+
+    ```cpp
+    std::istream& operator>>(std::istream& input, Object& object);
+    ```
+
+    If the file is malformed, libTorrent throws `torrent::bencode_error` (a subclass of `torrent::input_error`).
+  </Step>
+
+  <Step title="Add the download">
+    Pass the heap-allocated `Object*` and a tracker key to `download_add`. It returns a `Download` handle:
+
+    ```cpp
+    torrent::Download dl = torrent::download_add(meta, 0);
+    ```
+
+    The function signature from `torrent.h`:
+
+    ```cpp
+    Download download_add(Object* s, uint32_t tracker_key) LIBTORRENT_EXPORT;
+    ```
+
+    If `download_add` throws, you are responsible for deleting `meta`. If it succeeds, the library owns `meta` and `download_remove` will free it.
+
+    <Warning>
+      Always check `dl.is_valid()` before calling methods on a `Download`. A `Download` is a thin pointer wrapper — passing an invalid one to library functions is undefined behavior.
+    </Warning>
+  </Step>
+
+  <Step title="Open, hash-check, and start">
+    A `Download` must pass through three state transitions before it transfers data:
+
+    ```cpp
+    dl.open();              // prepares file handles and mmap regions
+    dl.hash_check(false);  // verifies existing chunk hashes on disk
+    dl.start();            // connects to trackers and begins transferring
+    ```
+
+    `hash_check(bool tryQuick)` — when `tryQuick` is `false`, the library checks every chunk. When `true`, it stops at the first chunk that cannot be memory-mapped and returns early. Use `false` for an initial run and `true` when resume data is already loaded.
+
+    After calling `start()`, check `dl.is_hash_checking()` if you need to wait for hashing to complete before proceeding.
+  </Step>
+
+  <Step title="Run the poll loop">
+    libTorrent is event-driven. You must call into the poll object repeatedly to process network and timer events:
+
+    ```cpp
+    auto* poll = torrent::this_thread::poll();
+    while (running) {
+        poll->do_poll(1000000);   // timeout in microseconds (1 second)
+    }
+    ```
+
+    `torrent::this_thread::poll()` returns the `net::Poll*` for the calling thread. Call `do_poll` with a timeout in **microseconds**. The function returns when events have been processed or the timeout expires.
+  </Step>
+
+  <Step title="Stop and clean up">
+    When you are done, stop downloads in reverse order before calling `cleanup`:
+
+    ```cpp
+    dl.stop();
+    dl.close();
+    torrent::download_remove(dl);
+    torrent::cleanup();
+    ```
+
+    `stop()` disconnects from trackers and peers. `close()` releases file handles and mmap regions. `download_remove()` frees the internal state and the `Object` that was passed to `download_add`. `cleanup()` shuts down the library's internal threads and managers.
+
+    <Tip>
+      Stopping all downloads before calling `cleanup()` is not strictly required, but the source comment in `torrent.h` recommends it: "Stopping all torrents and waiting for them to finish is not required, but recommended."
+    </Tip>
+  </Step>
+</Steps>
+
+## Error handling
+
+All libTorrent exceptions inherit from `torrent::base_error`, which extends `std::exception`. Catch the hierarchy from most specific to least specific:
+
+```cpp
+try {
+    torrent::Download dl = torrent::download_add(meta, 0);
+    dl.open();
+    dl.hash_check(false);
+    dl.start();
+} catch (const torrent::bencode_error& e) {
+    // Malformed .torrent file
+    std::cerr << "parse error: " << e.what() << "\n";
+    delete meta;
+} catch (const torrent::storage_error& e) {
+    // Disk I/O failure
+    std::cerr << "storage error: " << e.what() << "\n";
+} catch (const torrent::network_error& e) {
+    // Connection or tracker failure
+    std::cerr << "network error: " << e.what() << "\n";
+} catch (const torrent::base_error& e) {
+    // Any other libTorrent error
+    std::cerr << "libtorrent error: " << e.what() << "\n";
+}
+```
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Download lifecycle" icon="arrow-progress" href="/concepts/download-lifecycle">
+    Learn how downloads transition between states and how to respond to each
+  </Card>
+  <Card title="API reference" icon="code" href="/api/torrent-namespace">
+    Full documentation for every function in the torrent namespace
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

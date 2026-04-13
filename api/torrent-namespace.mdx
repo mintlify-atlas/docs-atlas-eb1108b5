@@ -1,0 +1,310 @@
+---
+title: "torrent Namespace — Global Library Function Reference"
+description: "Reference for every free function in the torrent:: namespace: initialization, manager accessors, download management, rates, and sub-namespace overviews."
+---
+
+The `torrent` namespace is the top-level entry point for the entire libTorrent library. It exposes free functions for library initialization and teardown, global manager accessors, download lifecycle management, and rate measurement. Several nested namespaces — `torrent::runtime`, `torrent::config`, `torrent::this_thread`, `torrent::main_thread`, and `torrent::net_thread` — group functionality by concern and thread context. You call all of these functions directly from your application code after including `<torrent/torrent.h>` and `<torrent/common.h>`.
+
+<Warning>
+  You must call `initialize_main_thread()` from the main thread **before** calling any other library function, and before seeding the random number generators. Calling `initialize()` before `initialize_main_thread()` leads to undefined behavior.
+</Warning>
+
+---
+
+## Initialization and teardown
+
+```cpp
+namespace torrent {
+
+void initialize_main_thread();
+void initialize();
+void cleanup();
+
+bool is_inactive();
+bool is_initialized();
+
+void set_main_thread_slots(std::function<void()> do_work);
+
+}
+```
+
+| Function | Description |
+|---|---|
+| `initialize_main_thread()` | Must be the first library call you make, called from the main thread. Seed `srandom` and `srand48` before this call. |
+| `initialize()` | Second initialization step. Call after `initialize_main_thread()` completes. |
+| `cleanup()` | Cleanly shuts down the library. Stopping all downloads before calling this is not required but is recommended. |
+| `is_inactive() → bool` | Returns `true` when the library has no active downloads and is safe to shut down. |
+| `is_initialized() → bool` | Returns `true` after a successful `initialize()` call. |
+| `set_main_thread_slots(std::function<void()> do_work)` | Registers the callback the library invokes when it needs work performed on the main thread. You must implement and pass this to drive the event loop. |
+
+<Tip>
+  A minimal startup sequence looks like this:
+
+  ```cpp
+  srandom(time(nullptr));
+  srand48(time(nullptr));
+
+  torrent::initialize_main_thread();
+  torrent::initialize();
+  ```
+</Tip>
+
+---
+
+## Manager accessors
+
+These functions return pointers to singleton manager objects. All pointers remain valid for the lifetime of the library after `initialize()` has been called.
+
+```cpp
+namespace torrent {
+
+ChunkManager*      chunk_manager();
+ClientList*        client_list();
+ConnectionManager* connection_manager();
+FileManager*       file_manager();
+ResourceManager*   resource_manager();
+
+}
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `chunk_manager()` | `ChunkManager*` | Controls how file data is mapped into memory chunks and how chunks are reclaimed. |
+| `client_list()` | `ClientList*` | Registry of known client identifiers, used to decode peer ID strings. |
+| `connection_manager()` | `ConnectionManager*` | Manages the global listen socket, connection limits, and incoming handshake behavior. |
+| `file_manager()` | `FileManager*` | Tracks all open file descriptors across all downloads and enforces system limits. |
+| `resource_manager()` | `ResourceManager*` | Distributes upload slots and unchoke slots across all active downloads. |
+
+---
+
+## Global statistics
+
+```cpp
+namespace torrent {
+
+uint32_t     total_handshakes();
+
+Throttle*    down_throttle_global();
+Throttle*    up_throttle_global();
+
+const Rate*  down_rate();
+const Rate*  up_rate();
+
+const char*  version();
+
+}
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `total_handshakes()` | `uint32_t` | Number of peer handshakes currently in progress across all downloads. |
+| `down_throttle_global()` | `Throttle*` | Global download throttle applied to all connections. Modify to enforce a byte-per-second cap. |
+| `up_throttle_global()` | `Throttle*` | Global upload throttle applied to all connections. |
+| `down_rate()` | `const Rate*` | Aggregate download rate across all active downloads (bytes per second). |
+| `up_rate()` | `const Rate*` | Aggregate upload rate across all active downloads (bytes per second). |
+| `version()` | `const char*` | Null-terminated string containing the library version, e.g. `"0.13.8"`. |
+
+---
+
+## Encoding list
+
+```cpp
+namespace torrent {
+
+using EncodingList = std::list<std::string>;
+
+EncodingList* encoding_list();
+
+}
+```
+
+`encoding_list()` returns a pointer to the ordered list of character encoding names (e.g. `"UTF-8"`, `"ISO-8859-1"`) that libTorrent tries when converting raw torrent path strings to filesystem names. Populate this list at startup to control how multi-byte filenames are decoded.
+
+---
+
+## Download management
+
+```cpp
+namespace torrent {
+
+using DList = std::list<Download>;
+
+Download download_add(Object* s, uint32_t tracker_key);
+void     download_remove(Download d);
+void     download_list(DList& dlist);
+Download download_find(const std::string& infohash);
+
+uint32_t download_priority(Download d);
+void     download_set_priority(Download d, uint32_t pri);
+
+}
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `download_add(Object* s, uint32_t tracker_key)` | `Download` | Creates a new download from a heap-allocated `Object` containing the decoded `.torrent` bencode. Always returns a valid `Download`; throws on error. If it throws, **you** must `delete s`; otherwise `download_remove` frees it. |
+| `download_remove(Download d)` | `void` | Removes the download and frees the `Object` passed to `download_add`. Stop the download before removing it. |
+| `download_list(DList& dlist)` | `void` | Appends every active download to `dlist`. You are responsible for clearing `dlist` before the call to avoid duplicates. |
+| `download_find(const std::string& infohash)` | `Download` | Looks up a download by its info-hash string. Always call `is_valid()` on the returned `Download` — it returns an invalid handle if not found. |
+| `download_priority(Download d)` | `uint32_t` | Returns the scheduling priority for the given download. |
+| `download_set_priority(Download d, uint32_t pri)` | `void` | Sets the scheduling priority for the given download. Higher values have greater priority. |
+
+<Note>
+  The `Object*` you pass to `download_add` must be allocated with `new`. libTorrent takes ownership on success and deletes it when you call `download_remove`.
+</Note>
+
+---
+
+## torrent::runtime namespace
+
+`torrent::runtime` exposes objects and helpers that relate to the network and socket subsystems.
+
+```cpp
+namespace torrent::runtime {
+
+NetworkManager* network_manager();
+SocketManager*  socket_manager();
+
+void     dht_add_peer_node(const sockaddr* sa, uint16_t port);
+uint16_t listen_port();
+
+}
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `network_manager()` | `NetworkManager*` | Access the network manager that owns HTTP stacks and other network-level objects. |
+| `socket_manager()` | `SocketManager*` | Access the socket manager responsible for polling and I/O dispatch. |
+| `dht_add_peer_node(const sockaddr* sa, uint16_t port)` | `void` | Injects a known DHT node address into the routing table, bootstrapping DHT discovery. |
+| `listen_port()` | `uint16_t` | Returns the UDP/TCP port on which the library is currently listening for peer connections. |
+
+---
+
+## torrent::config namespace
+
+```cpp
+namespace torrent::config {
+
+torrent::net::NetworkConfig* network_config();
+
+}
+```
+
+`network_config()` returns a pointer to the `NetworkConfig` object where you set network-layer options such as proxy settings and DNS resolution parameters. Call this after `initialize()`.
+
+---
+
+## torrent::this_thread namespace
+
+`torrent::this_thread` provides access to thread-local infrastructure for whichever thread calls these functions. Use them inside callbacks to interact with the current thread's event loop.
+
+```cpp
+namespace torrent::this_thread {
+
+torrent::utils::Thread*   thread();
+std::thread::id           thread_id();
+
+std::chrono::microseconds cached_time();
+std::chrono::seconds      cached_seconds();
+
+void callback(void* target, std::function<void()>&& fn);
+void cancel_callback(void* target);
+void cancel_callback_and_wait(void* target);
+
+net::Poll*       poll();
+net::Resolver*   resolver();
+utils::Scheduler* scheduler();
+
+// Weak event helpers (see below)
+void event_open(Event* event);
+void event_open_and_count(Event* event);
+void event_close_and_count(Event* event);
+void event_closed_and_count(Event* event);
+void event_insert_read(Event* event);
+void event_insert_write(Event* event);
+void event_insert_error(Event* event);
+void event_remove_read(Event* event);
+void event_remove_write(Event* event);
+void event_remove_error(Event* event);
+void event_remove_and_close(Event* event);
+
+}
+```
+
+| Function | Description |
+|---|---|
+| `thread()` | Returns the `utils::Thread` object for the calling thread. |
+| `thread_id()` | Returns the `std::thread::id` for the calling thread. |
+| `cached_time()` | Returns a cached `std::chrono::microseconds` timestamp, updated each event loop iteration. Cheaper than a syscall. |
+| `cached_seconds()` | Returns a cached `std::chrono::seconds` timestamp. |
+| `callback(target, fn)` | Schedules `fn` to run on the current thread's event loop, keyed by `target`. Replaces any existing callback for the same `target`. |
+| `cancel_callback(target)` | Cancels a pending callback. Does not block. |
+| `cancel_callback_and_wait(target)` | Cancels a pending callback and blocks until it is confirmed cancelled or completed. |
+| `poll()` | Returns the `net::Poll` instance driving this thread's I/O. |
+| `resolver()` | Returns the async DNS resolver for the current thread. |
+| `scheduler()` | Returns the timer scheduler for the current thread. |
+| `event_*` functions | Weak-linked helpers for registering, deregistering, and counting `Event` objects with the current thread's poll instance. |
+
+---
+
+## torrent::main_thread namespace
+
+`torrent::main_thread` provides access to the main thread specifically, regardless of the calling context. Use these to schedule work back to the main thread from other threads.
+
+```cpp
+namespace torrent::main_thread {
+
+torrent::utils::Thread* thread();
+std::thread::id         thread_id();
+
+void     callback(void* target, std::function<void()>&& fn);
+void     cancel_callback(void* target);
+void     cancel_callback_and_wait(void* target);
+
+uint32_t hash_queue_size();
+
+}
+```
+
+| Function | Description |
+|---|---|
+| `thread()` | Returns the `utils::Thread` object for the main thread. |
+| `thread_id()` | Returns the `std::thread::id` of the main thread. |
+| `callback(target, fn)` | Schedules `fn` on the main thread's event loop, keyed by `target`. Safe to call from any thread. |
+| `cancel_callback(target)` | Cancels a pending main-thread callback. |
+| `cancel_callback_and_wait(target)` | Cancels a pending main-thread callback and waits for confirmation. |
+| `hash_queue_size()` | Returns the number of chunk-hash verification tasks currently queued on the main thread. |
+
+---
+
+## torrent::net_thread namespace
+
+`torrent::net_thread` provides access to the dedicated network thread. Use these to schedule network operations or retrieve HTTP stack access.
+
+```cpp
+namespace torrent::net_thread {
+
+torrent::utils::Thread* thread();
+std::thread::id         thread_id();
+
+void callback(void* target, std::function<void()>&& fn);
+void callback_interrupt_polling(void* target, std::function<void()>&& fn);
+void callback_interrupt_polling_and_wait(void* target, std::function<void()>&& fn);
+void cancel_callback(void* target);
+void cancel_callback_and_wait(void* target);
+
+torrent::net::HttpStack* http_stack();
+
+}
+```
+
+| Function | Description |
+|---|---|
+| `thread()` | Returns the `utils::Thread` for the network thread. |
+| `thread_id()` | Returns the `std::thread::id` of the network thread. |
+| `callback(target, fn)` | Schedules `fn` on the network thread's event loop. |
+| `callback_interrupt_polling(target, fn)` | Schedules `fn` and interrupts polling so the callback executes immediately. |
+| `callback_interrupt_polling_and_wait(target, fn)` | Like `callback_interrupt_polling`, but blocks until execution completes. |
+| `cancel_callback(target)` | Cancels a pending network-thread callback. |
+| `cancel_callback_and_wait(target)` | Cancels a pending network-thread callback and waits for confirmation. |
+| `http_stack()` | Returns the `HttpStack` used for HTTP tracker announcements and scrapes. |

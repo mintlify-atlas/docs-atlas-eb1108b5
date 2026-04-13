@@ -1,0 +1,225 @@
+---
+title: "ChunkManager — mmap memory limits and sync control"
+description: "Reference for ChunkManager: memory cap, sync timeouts, preloading settings, and allocation accounting; plus FileManager file descriptor limit control."
+---
+
+`ChunkManager` is the central controller for libTorrent's memory-mapped I/O subsystem. It tracks how much memory is currently mapped across all active downloads, enforces a configurable cap, schedules periodic syncs to disk, and controls preload behavior for streaming workloads. You access the global instance through `torrent::chunk_manager()`.
+
+```cpp
+#include <torrent/chunk_manager.h>
+
+torrent::ChunkManager* cm = torrent::chunk_manager();
+```
+
+<Note>
+  `ChunkManager` is a singleton managed by the library. Do not construct or destroy it yourself.
+</Note>
+
+## Memory usage
+
+These methods report the library's current memory consumption and let you raise or lower the cap.
+
+```cpp
+uint64_t memory_usage() const;            // bytes currently mapped across all downloads
+uint64_t sync_queue_memory_usage() const; // bytes held by chunks waiting to be synced
+
+uint32_t memory_block_count() const;      // number of individual mapped blocks
+uint32_t sync_queue_size() const;         // number of chunks in the sync queue
+
+uint64_t max_memory_usage() const;        // current cap in bytes
+void     set_max_memory_usage(uint64_t bytes);
+
+static uint64_t estimate_max_memory_usage(); // system RAM estimate, capped at 1 GB
+
+uint64_t safe_free_diskspace() const;     // minimum free disk space across all torrent volumes
+```
+
+### Default memory cap
+
+The default `max_memory_usage` is `(estimate_max_memory_usage() * 4) / 5`. This leaves roughly one-fifth of estimated RAM available to the rest of the application.
+
+`estimate_max_memory_usage()` queries the OS for available physical RAM and caps the result at 1 GB. If the query fails it returns a conservative fallback.
+
+<Tip>
+  If your application maps significant memory itself (e.g. large databases or graphics buffers), call `set_max_memory_usage()` to reduce the cap and leave room for your own allocations.
+</Tip>
+
+```cpp
+// Reserve 512 MB for libTorrent chunk maps:
+cm->set_max_memory_usage(512ULL * 1024 * 1024);
+
+// Query current state:
+uint64_t used = cm->memory_usage();
+uint64_t cap  = cm->max_memory_usage();
+std::cout << used << " / " << cap << " bytes used\n";
+```
+
+## Sync settings
+
+libTorrent defers `msync` calls to avoid forcing the kernel to flush pages prematurely. These settings control when syncs are triggered.
+
+```cpp
+bool     safe_sync() const;
+void     set_safe_sync(uint32_t state);
+
+uint32_t timeout_sync() const;
+void     set_timeout_sync(uint32_t seconds);      // default: 600
+
+uint32_t timeout_safe_sync() const;
+void     set_timeout_safe_sync(uint32_t seconds); // default: 900
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `timeout_sync` | 600 s | Seconds after the last write before a normal sync is attempted |
+| `timeout_safe_sync` | 900 s | Seconds after the last write before a forced "safe" sync is attempted |
+| `safe_sync` | `false` | When `true`, uses `MS_SYNC` instead of `MS_ASYNC` for all syncs |
+
+The timeout is measured from the last write to a chunk. Setting a short timeout reduces the window for data loss on crash but increases I/O activity.
+
+```cpp
+cm->set_timeout_sync(300);       // sync 5 minutes after last write
+cm->set_timeout_safe_sync(600);  // force safe sync after 10 minutes
+cm->set_safe_sync(true);         // always use synchronous msync
+```
+
+## Preloading
+
+libTorrent can preload upcoming chunks into the page cache for downloads that are keeping up with their rate requirements. Set the preload type to `0` to disable preloading entirely.
+
+```cpp
+uint32_t preload_type() const;
+void     set_preload_type(uint32_t t);          // 0 = disabled
+
+uint32_t preload_min_size() const;
+void     set_preload_min_size(uint32_t bytes);  // default: 256 KB (256 << 10)
+
+uint32_t preload_required_rate() const;
+void     set_preload_required_rate(uint32_t bytes); // default: 5 KB/s per MB of chunk size (5 << 10)
+```
+
+`preload_required_rate` is a per-megabyte-of-chunk-size threshold. For example, with a 1 MB chunk size and the default rate of `5 << 10` (5120 bytes/s), the download must be sustaining at least 5 KB/s before preloading activates.
+
+```cpp
+// Enable preloading with a 512 KB minimum chunk size:
+cm->set_preload_type(1);
+cm->set_preload_min_size(512 << 10);
+cm->set_preload_required_rate(10 << 10); // 10 KB/s per MB of chunk
+```
+
+## Allocation
+
+These methods let `ChunkList` (and optionally your application) account for memory that has been mapped or will be mapped. They update the internal usage counter so the cap can be enforced correctly.
+
+```cpp
+static constexpr int allocate_revert_log = (1 << 0); // log the revert, not the allocation
+static constexpr int allocate_dont_log   = (1 << 1); // suppress logging entirely
+
+bool allocate(uint32_t size, int flags = 0);
+void deallocate(uint32_t size, int flags = 0);
+```
+
+`allocate()` returns `true` if the requested `size` bytes fit within the remaining quota (`max_memory_usage - memory_usage`). It does not actually map memory — it only updates the accounting. Call `deallocate()` with the same size if you discover the allocation is not needed after all (pass `allocate_revert_log` to log it as a revert rather than a fresh deallocation).
+
+```cpp
+void try_free_memory(uint64_t size);
+```
+
+`try_free_memory()` iterates over all registered `ChunkList` instances and asks them to release mapped chunks until at least `size` bytes have been freed, or there is nothing left to free.
+
+```cpp
+void periodic_sync();
+```
+
+`periodic_sync()` should be called from your event loop at regular intervals (libTorrent calls it internally from the scheduler). It flushes chunks whose timeout has expired.
+
+## Statistics
+
+```cpp
+uint32_t stats_preloaded() const;
+void     inc_stats_preloaded();
+
+uint32_t stats_not_preloaded() const;
+void     inc_stats_not_preloaded();
+```
+
+These counters record how many chunks were served from the page cache (preloaded) versus how many required a page fault (not preloaded). They are intended for diagnostic purposes and are incremented internally by chunk handling code; you can read them to monitor cache efficiency.
+
+```cpp
+double hit_rate = static_cast<double>(cm->stats_preloaded()) /
+                  (cm->stats_preloaded() + cm->stats_not_preloaded());
+std::cout << "Preload hit rate: " << hit_rate * 100 << "%\n";
+```
+
+## ChunkList registration
+
+`ChunkList` instances register themselves with the global `ChunkManager` when a download is opened, and deregister when it is closed. These methods are called internally.
+
+```cpp
+void insert(ChunkList* chunkList);
+void erase(ChunkList* chunkList);
+```
+
+<Warning>
+  Do not call `insert` or `erase` directly. They are called automatically by the download open/close lifecycle. Calling them out of order will corrupt the manager's internal state.
+</Warning>
+
+## FileManager
+
+`FileManager` tracks the set of currently open file descriptors across all downloads and enforces a per-process cap. You access it through `torrent::file_manager()`.
+
+```cpp
+#include <torrent/data/file_manager.h>
+```
+
+```cpp
+uint32_t open_files() const;           // number of currently open file descriptors
+
+uint32_t max_open_files() const;
+void     set_max_open_files(size_type s); // cap on open file descriptors
+
+bool     advise_random() const;
+void     set_advise_random(bool state);          // hint OS to use random-access I/O
+
+bool     advise_random_hashing() const;
+void     set_advise_random_hashing(bool state);  // use random-access hint during hashing
+
+bool     open(value_type file, bool hashing, int prot, int flags);
+void     close(value_type file);
+void     close_least_active(); // close the file with the oldest last_touched timestamp
+
+// Counters:
+uint64_t files_opened_counter() const;
+uint64_t files_closed_counter() const;
+uint64_t files_failed_counter() const;
+```
+
+When `open_files()` reaches `max_open_files()`, calling `open()` triggers `close_least_active()` to make room. Setting `advise_random` to `true` causes the library to issue `posix_fadvise(POSIX_FADV_RANDOM)` on opened files, which can improve performance when chunks are requested out of sequence.
+
+<AccordionGroup>
+  <Accordion title="Tuning example">
+
+```cpp
+torrent::ChunkManager* cm = torrent::chunk_manager();
+torrent::FileManager*  fm = torrent::file_manager();
+
+// Memory: allow 1 GB for chunk maps
+cm->set_max_memory_usage(1024ULL * 1024 * 1024);
+
+// Sync: sync 2 minutes after last write
+cm->set_timeout_sync(120);
+cm->set_timeout_safe_sync(300);
+
+// Preload: enable for fast connections
+cm->set_preload_type(1);
+cm->set_preload_min_size(256 << 10);
+
+// File descriptors: allow 512 open files
+fm->set_max_open_files(512);
+
+// Use random-access hints for hashing
+fm->set_advise_random_hashing(true);
+```
+
+  </Accordion>
+</AccordionGroup>

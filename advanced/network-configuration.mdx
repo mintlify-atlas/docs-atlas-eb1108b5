@@ -1,0 +1,236 @@
+---
+title: "Network Configuration for libTorrent"
+description: "Configure bind addresses, connection limits, encryption, per-address throttles, DNS resolution, and poll backends to tune libTorrent's network behavior."
+---
+
+libTorrent exposes fine-grained control over how it binds to network interfaces, how many connections it keeps open, and how it encrypts peer traffic. Most settings live in `NetworkConfig`, which you reach through `torrent::config::network_config()`, and in `ConnectionManager`, which you reach through `torrent::connection_manager()`.
+
+## Accessing configuration objects
+
+```cpp
+#include <torrent/common.h>
+#include <torrent/torrent.h>
+#include <torrent/net/network_config.h>
+#include <torrent/connection_manager.h>
+
+torrent::net::NetworkConfig* nc = torrent::config::network_config();
+torrent::ConnectionManager*  cm = torrent::connection_manager();
+
+// Runtime managers (available after initialize()).
+torrent::runtime::NetworkManager* nm = torrent::runtime::network_manager();
+torrent::runtime::SocketManager*  sm = torrent::runtime::socket_manager();
+
+// Convenience accessors on the runtime namespace.
+uint16_t port = torrent::runtime::listen_port();
+```
+
+## Bind and local addresses
+
+`NetworkConfig` tracks two separate address concepts:
+
+- **Bind address** — the source address the library binds outgoing sockets to
+- **Local address** — the address advertised to peers and trackers (useful when behind NAT)
+
+Both support independent IPv4 and IPv6 values.
+
+```cpp
+// Set bind address (accepts IPv4 or IPv6 sockaddr).
+nc->set_bind_address(const sockaddr* sa);
+nc->set_bind_address_str(const std::string& addr);
+
+// Set per-family bind addresses explicitly.
+nc->set_bind_inet_address(const sockaddr* sa);
+nc->set_bind_inet6_address(const sockaddr* sa);
+
+// Set the address announced to peers and trackers.
+nc->set_local_address(const sockaddr* sa);
+nc->set_local_inet_address(const sockaddr* sa);
+nc->set_local_inet6_address(const sockaddr* sa);
+
+// Retrieve the best-match address for the active protocol stack.
+torrent::net::c_sa_shared_ptr best = nc->bind_address_best_match();
+std::string best_str = nc->bind_address_best_match_str();
+```
+
+### IPv4/IPv6 filtering
+
+```cpp
+nc->set_block_ipv4(bool v);      // Block all IPv4 connections
+nc->set_block_ipv6(bool v);      // Block all IPv6 connections
+nc->set_block_ipv4in6(bool v);   // Block IPv4-mapped IPv6 addresses
+nc->set_block_outgoing(bool v);  // Block all outgoing connections
+nc->set_prefer_ipv6(bool v);     // Prefer IPv6 when both are available
+```
+
+<Note>
+  If you bind to an IPv6 address and also call `set_block_ipv6(true)`, the library cannot make outgoing connections. `bind_address_or_null()` returns null in that case.
+</Note>
+
+## Encryption options
+
+libTorrent supports MSE/PE protocol encryption. Set a bitmask of the constants defined on `NetworkConfig`:
+
+```cpp
+// Allow unencrypted and encrypted peers to connect to us.
+nc->set_encryption_options(
+    torrent::net::NetworkConfig::encryption_allow_incoming |
+    torrent::net::NetworkConfig::encryption_try_outgoing  |
+    torrent::net::NetworkConfig::encryption_enable_retry
+);
+```
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `encryption_none` | `0x0` | No encryption |
+| `encryption_allow_incoming` | `0x1` | Accept encrypted inbound connections |
+| `encryption_try_outgoing` | `0x2` | Try encryption on outbound connections |
+| `encryption_require` | `0x3` | Require encryption |
+| `encryption_require_RC4` | `0x4` | Require RC4 stream cipher |
+| `encryption_enable_retry` | `0x8` | Retry with plaintext if encrypted handshake fails |
+| `encryption_prefer_plaintext` | `0x10` | Prefer plaintext when both sides support it |
+
+## Socket buffer sizes
+
+```cpp
+nc->set_send_buffer_size(uint32_t s);    // SO_SNDBUF hint (0 = OS default)
+nc->set_receive_buffer_size(uint32_t s); // SO_RCVBUF hint (0 = OS default)
+```
+
+## IP type-of-service priority
+
+```cpp
+nc->set_priority(torrent::net::NetworkConfig::iptos_throughput);  // default
+nc->set_priority(torrent::net::NetworkConfig::iptos_lowdelay);
+nc->set_priority(torrent::net::NetworkConfig::iptos_reliability);
+```
+
+## Connection limits
+
+`ConnectionManager` enforces a hard cap on the number of open sockets. Set this before calling `torrent::initialize()` or adjust it at runtime.
+
+```cpp
+torrent::ConnectionManager* cm = torrent::connection_manager();
+
+cm->set_max_size(500);  // Allow at most 500 open sockets
+uint32_t current = cm->size();
+uint32_t limit   = cm->max_size();
+
+// The library checks this before initiating outbound connections.
+bool ok = cm->can_connect();
+```
+
+Track the total number of in-progress handshakes across all downloads:
+
+```cpp
+uint32_t hs = torrent::total_handshakes();
+```
+
+## Connection filter
+
+Install a filter slot to accept or reject connections by address before a handshake begins. Return `0` to allow or a non-zero value to block.
+
+```cpp
+cm->set_filter([](const sockaddr* sa) -> uint32_t {
+    // Inspect sa (sockaddr_in or sockaddr_in6) and return 0 to allow.
+    return 0;
+});
+```
+
+## Per-address throttles
+
+`ThrottlePair` is a `std::pair<Throttle*, Throttle*>` where the first element is the upload throttle and the second is the download throttle. Install a slot on `ConnectionManager` to return per-address throttle pairs:
+
+```cpp
+cm->address_throttle() = [](const sockaddr* sa) -> torrent::ThrottlePair {
+    // Return specific throttles for this address, or {nullptr, nullptr}
+    // to use the global throttle.
+    if (is_local_network(sa))
+        return {local_up_throttle, local_down_throttle};
+    return {nullptr, nullptr};
+};
+```
+
+## DHT peer nodes
+
+Add known DHT bootstrap nodes at runtime:
+
+```cpp
+// sa must point to a sockaddr_in or sockaddr_in6.
+torrent::runtime::dht_add_peer_node(const sockaddr* sa, uint16_t port);
+```
+
+## I/O poll backend
+
+libTorrent selects the poll backend at compile time based on the host OS:
+
+<Tabs>
+  <Tab title="Linux (epoll)">
+    On Linux, `Poll::create()` returns an `epoll`-backed instance. Enable it at configure time (selected automatically):
+
+    ```bash
+    ./configure  # epoll is used by default on Linux
+    ```
+  </Tab>
+  <Tab title="macOS / BSD (kqueue)">
+    On macOS and BSD systems, `Poll::create()` returns a `kqueue`-backed instance:
+
+    ```bash
+    ./configure  # kqueue is used by default on macOS/BSD
+    ```
+  </Tab>
+</Tabs>
+
+Access the current thread's `Poll` object through `torrent::this_thread::poll()`. You normally do not need to call `Poll` methods directly—use the `event_*` free functions in `torrent::this_thread` instead.
+
+```cpp
+torrent::net::Poll* p = torrent::this_thread::poll();
+uint32_t max_fds = p->open_max();
+```
+
+## Async DNS resolution
+
+`Resolver` provides non-blocking hostname resolution for all three address modes. Call it from any thread; the callback fires on the owning thread.
+
+```cpp
+torrent::net::Resolver* r = torrent::this_thread::resolver();
+
+// Resolve both IPv4 and IPv6 addresses in parallel.
+r->resolve_both(
+    this,                                                // requester key
+    "tracker.example.com",
+    AF_UNSPEC,
+    [](torrent::net::c_sin_shared_ptr  v4, int v4_err,
+       torrent::net::c_sin6_shared_ptr v6, int v6_err) {
+        // Both results available here.
+    }
+);
+
+// Resolve and return whichever family the NetworkConfig prefers.
+r->resolve_preferred(this, "tracker.example.com", AF_UNSPEC, AF_INET6,
+    [](torrent::net::c_sa_shared_ptr addr, int err) { /* ... */ });
+
+// Resolve a specific address family only.
+r->resolve_specific(this, "tracker.example.com", AF_INET,
+    [](torrent::net::c_sa_shared_ptr addr, int err) { /* ... */ });
+
+// Cancel all pending lookups for this requester.
+r->cancel(this);
+```
+
+## HTTP stack
+
+The net thread's `HttpStack` handles all tracker HTTP/HTTPS announce and scrape requests. You can access it from the net thread to inspect active requests.
+
+```cpp
+// Must be called from the net thread (or via net_thread::callback).
+torrent::net::HttpStack* hs = torrent::net_thread::http_stack();
+```
+
+## Proxy support
+
+Configure an outbound proxy address for all peer connections:
+
+```cpp
+nc->set_proxy_address(const sockaddr* sa);
+std::string proxy = nc->proxy_address_str();
+```

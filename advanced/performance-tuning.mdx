@@ -1,0 +1,219 @@
+---
+title: "Performance Tuning libTorrent"
+description: "Tune libTorrent for high throughput by configuring memory limits, connection caps, throttle rates, chunk preloading, and compile-time optimization flags."
+---
+
+libTorrent is designed for high throughput from the start—it uses `mmap` for zero-copy I/O and a cached clock to minimize syscalls. Even so, the defaults are deliberately conservative so the library works on a wide range of hardware. This page shows you which knobs to turn and which defaults to override to get the best performance for your workload.
+
+## Memory management with ChunkManager
+
+`ChunkManager` controls how much memory libTorrent uses for memory-mapped file chunks. Retrieve the instance with `torrent::chunk_manager()`.
+
+### Setting the memory limit
+
+By default, the library uses 4/5 of `estimate_max_memory_usage()`, which is itself capped at 1 GB. If your system has more RAM available, raise the limit explicitly.
+
+```cpp
+torrent::ChunkManager* cm = torrent::chunk_manager();
+
+// Query the automatic estimate (capped at 1 GB).
+uint64_t estimated = torrent::ChunkManager::estimate_max_memory_usage();
+
+// Set to 75% of physical RAM, for example.
+cm->set_max_memory_usage(physical_ram_bytes * 3 / 4);
+
+// Check current usage.
+uint64_t in_use = cm->memory_usage();
+```
+
+<Tip>
+  Give libTorrent as much memory as you can spare. Larger mapping windows mean fewer re-maps and higher sustained write throughput on spinning disks.
+</Tip>
+
+### Sync timing
+
+The library queues dirty chunks and flushes them in the background. Two timeouts control when a sync is triggered:
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `timeout_sync` | 600 s | Minimum idle time before syncing a dirty chunk |
+| `timeout_safe_sync` | 900 s | Maximum age of an unsynced chunk |
+
+```cpp
+cm->set_timeout_sync(uint32_t seconds);       // default: 600
+cm->set_timeout_safe_sync(uint32_t seconds);  // default: 900
+```
+
+Set `safe_sync` to `true` to force the library to sync chunks to disk before verifying their hash. This is slower but safer on unstable storage.
+
+```cpp
+cm->set_safe_sync(uint32_t state); // non-zero = enabled
+```
+
+### Chunk preloading
+
+Enable preloading to push upcoming chunks into the page cache before they are needed, improving read-ahead performance when seeding.
+
+```cpp
+// 0 = disabled (default), 1 = enabled.
+cm->set_preload_type(uint32_t t);
+
+// Minimum chunk size to trigger preloading (default: 256 KB).
+cm->set_preload_min_size(uint32_t bytes);  // default: 256 << 10
+
+// Minimum transfer rate per MB of chunk size before preloading (default: 5 KB/s).
+cm->set_preload_required_rate(uint32_t bytes);  // default: 5 << 10
+```
+
+The `preload_required_rate` threshold is expressed in bytes per second per whole megabyte of chunk size. A 4 MB chunk requires at least 20 KB/s to trigger preloading at the 5 KB/s-per-MB default.
+
+```cpp
+// Check preload hit rate.
+uint32_t hits   = cm->stats_preloaded();
+uint32_t misses = cm->stats_not_preloaded();
+```
+
+## Connection limits
+
+Raising the open-socket limit lets you connect to more peers simultaneously. Balance this against your OS file descriptor limit (`ulimit -n`).
+
+```cpp
+torrent::ConnectionManager* cm = torrent::connection_manager();
+
+// Allow up to 1000 simultaneous open sockets.
+cm->set_max_size(1000);
+```
+
+<Warning>
+  Set your process's file descriptor limit (`ulimit -n`) before calling `set_max_size()`. libTorrent will attempt to open that many file descriptors, and you need enough headroom for torrent data files too.
+</Warning>
+
+## Global throttle rates
+
+libTorrent provides a pair of global throttles you can use to cap total upload and download bandwidth. A `max_rate` of `0` means unlimited.
+
+```cpp
+torrent::Throttle* up   = torrent::up_throttle_global();
+torrent::Throttle* down = torrent::down_throttle_global();
+
+// Cap upload to 10 MB/s, leave download unlimited.
+up->set_max_rate(10 * 1024 * 1024);  // bytes per second
+down->set_max_rate(0);               // 0 = unlimited
+
+// Check whether a throttle is currently active.
+bool is_throttled = up->is_throttled();
+
+// Read current rate.
+const torrent::Rate* up_rate = up->rate();
+```
+
+For per-address throttles, see [per-address throttles](/advanced/network-configuration#per-address-throttles).
+
+## Upload and download slot limits
+
+Control how many upload and download slots each download may use by setting these on the `Download` object:
+
+```cpp
+torrent::Download d = /* ... */;
+
+d.set_uploads_max(uint32_t n);    // Maximum simultaneous upload slots
+d.set_uploads_min(uint32_t n);    // Minimum slots to keep open
+d.set_downloads_max(uint32_t n);  // Maximum simultaneous download slots
+d.set_downloads_min(uint32_t n);  // Minimum slots to keep open
+```
+
+<Tip>
+  Set `uploads_max` to at least 4-8 for good seeding performance. The library will not upload to more peers than `uploads_max` even if bandwidth is available.
+</Tip>
+
+## Using cached_time() for performance
+
+Every libTorrent thread maintains a clock value updated once per event loop iteration. Use `torrent::this_thread::cached_time()` instead of calling the system clock from inside callbacks—it reads an atomic variable rather than making a syscall.
+
+```cpp
+// Fast — reads a pre-fetched atomic.
+auto now = torrent::this_thread::cached_time();
+
+// Slow — makes a syscall on every call.
+auto now = std::chrono::steady_clock::now();
+```
+
+`cached_seconds()` returns the same value rounded down to whole seconds, which is useful for coarse timeouts.
+
+## Zero-copy I/O
+
+libTorrent already uses `mmap` to map torrent files into memory and sends those pages directly to the network stack. To preserve this advantage in your embedding application:
+
+- Do not copy data out of `MemoryChunk` objects. Read from the mapped region in place.
+- Avoid holding `ChunkList` references across event loop iterations; the library may reclaim the mapping.
+- Do not add unnecessary intermediate buffers between libTorrent and your display or logging code.
+
+## Compile-time options
+
+Configure libTorrent's build to match your deployment environment.
+
+<AccordionGroup>
+  <Accordion title="Debug vs. release builds">
+    ```bash
+    # Release build (default): disables assertions, enables optimizations.
+    ./configure
+    make -j$(nproc)
+
+    # Debug build: enables assertions and additional runtime checks.
+    ./configure --enable-debug
+    make -j$(nproc)
+    ```
+
+    Always build with `--enable-debug` during development to catch assertion failures early. Use a release build in production.
+  </Accordion>
+  <Accordion title="Parallel compilation">
+    Pass `-jN` to `make` to compile in parallel. A good default is one fewer than the number of logical cores to leave the system responsive:
+
+    ```bash
+    make -j$(($(nproc) - 1))
+    ```
+  </Accordion>
+  <Accordion title="File preallocation (fallocate)">
+    Configure options control which preallocation syscall the library uses. `fallocate` is fastest on Linux ext4 and XFS; `posix_fallocate` is the portable fallback.
+
+    ```bash
+    ./configure --with-fallocate          # Use fallocate(2) on Linux
+    ./configure --with-posix-fallocate    # Use posix_fallocate(3) portably
+    ```
+  </Accordion>
+  <Accordion title="Aligned reads">
+    On some architectures, aligned memory reads improve performance. Enable the option if your target hardware benefits:
+
+    ```bash
+    ./configure --enable-aligned
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Monitoring performance
+
+Use these accessors to monitor the library's runtime behavior:
+
+```cpp
+// Current memory mapped by ChunkManager.
+uint64_t mem  = torrent::chunk_manager()->memory_usage();
+uint32_t blks = torrent::chunk_manager()->memory_block_count();
+
+// Pending sync queue size.
+uint32_t sq   = torrent::chunk_manager()->sync_queue_size();
+uint64_t sqm  = torrent::chunk_manager()->sync_queue_memory_usage();
+
+// Open socket count vs. limit.
+uint32_t open = torrent::connection_manager()->size();
+uint32_t max  = torrent::connection_manager()->max_size();
+
+// Total handshakes attempted (monotonically increasing).
+uint32_t hs   = torrent::total_handshakes();
+
+// Global transfer rates.
+const torrent::Rate* dr = torrent::down_rate();
+const torrent::Rate* ur = torrent::up_rate();
+
+// Hash-check backlog on the main thread.
+uint32_t hqs  = torrent::main_thread::hash_queue_size();
+```

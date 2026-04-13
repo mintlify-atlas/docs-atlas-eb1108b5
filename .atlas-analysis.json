@@ -1,0 +1,114 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "libTorrent",
+  "projectDescription": "A high-performance C++ BitTorrent library for *nix that transfers data directly from file pages to the network stack, designed for embedding in torrent clients.",
+  "theme": "aspen",
+  "primaryColor": "#41b1f8",
+  "lightColor": "#042b93",
+  "darkColor": "#cee4f4",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "building",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/download-lifecycle",
+              "concepts/chunk-management",
+              "concepts/peer-connections",
+              "concepts/throttling"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/managing-downloads",
+              "guides/file-management",
+              "guides/tracker-integration",
+              "guides/dht",
+              "guides/bencode"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/threading-model",
+              "advanced/network-configuration",
+              "advanced/error-handling",
+              "advanced/performance-tuning"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Library",
+            "pages": [
+              "api/torrent-namespace",
+              "api/download",
+              "api/download-info"
+            ]
+          },
+          {
+            "group": "Data & Files",
+            "pages": [
+              "api/file",
+              "api/file-list",
+              "api/chunk-manager",
+              "api/object-bencode"
+            ]
+          },
+          {
+            "group": "Networking",
+            "pages": [
+              "api/connection-manager",
+              "api/peer",
+              "api/tracker",
+              "api/throttle"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Zero-copy I/O: transfers directly from file pages to network stack via mmap",
+    "Multi-threaded architecture with separate main, net, and tracker threads",
+    "Full DHT (Distributed Hash Table) support for trackerless torrents",
+    "HTTP, UDP, and DHT tracker support",
+    "Protocol encryption support with MSE/PE",
+    "Peer Exchange (PEX) extension",
+    "Granular bandwidth throttling with per-address throttle pairs",
+    "Bencode serialization/deserialization via the Object class",
+    "Resume data support for interrupted downloads",
+    "File priority management (off, normal, high)"
+  ],
+  "publicApiSurface": [
+    "torrent::initialize() / torrent::cleanup()",
+    "torrent::download_add() / torrent::download_remove()",
+    "torrent::download_find() / torrent::download_list()",
+    "torrent::Download::open() / close() / start() / stop()",
+    "torrent::Download::hash_check() / hash_stop()",
+    "torrent::Download::file_list() / peer_list() / connection_list()",
+    "torrent::Download::set_upload_throttle() / set_download_throttle()",
+    "torrent::ChunkManager (memory management for mmap chunks)",
+    "torrent::ConnectionManager (socket count and filter management)",
+    "torrent::Throttle::create_throttle() / destroy_throttle()",
+    "torrent::Peer (peer state, rates, bitfield, disconnect)",
+    "torrent::tracker::Tracker (enable/disable, type, URL, state)",
+    "torrent::Object (bencode value, string, list, map types)",
+    "torrent::runtime::network_manager() / socket_manager()",
+    "torrent::this_thread::poll() / scheduler() / resolver()"
+  ]
+}

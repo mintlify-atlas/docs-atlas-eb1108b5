@@ -1,0 +1,168 @@
+---
+title: "Building libTorrent from Source on Linux and *nix Systems"
+description: "Compile libTorrent 0.16.9 on Linux or another *nix system: install dependencies, run autoreconf, configure, make, and make install."
+---
+
+libTorrent ships as a classic Autotools project. You run `autoreconf` to generate the build files, `./configure` to probe your system and set options, and `make` to compile. The steps below take you from a fresh clone to an installed shared library.
+
+<Note>
+  libTorrent requires a C++17-capable compiler. GCC 7+ and Clang 5+ both qualify. The configure script will error out if your compiler does not meet the requirement.
+</Note>
+
+## Build steps
+
+<Steps>
+  <Step title="Install build dependencies">
+    On Ubuntu and Debian-based systems, install the required tools and libraries:
+
+    ```bash
+    sudo apt install make curl-libcurlpp-dev autoconf
+    ```
+
+    The build also requires **zlib**, **libcurl**, **OpenSSL** (for crypto), and **pthread**. Most distributions package these alongside the tools above or already have them installed. The configure script will report any missing dependencies.
+  </Step>
+
+  <Step title="Enter the repository directory">
+    Change into the cloned repository root:
+
+    ```bash
+    cd libtorrent
+    ```
+  </Step>
+
+  <Step title="Generate build files">
+    Run `autoreconf` to create the `configure` script and supporting Makefiles from the Autotools sources:
+
+    ```bash
+    autoreconf -ivf
+    ```
+
+    The flags mean: `-i` installs missing auxiliary files, `-v` prints verbose output, and `-f` forces regeneration even if files appear up to date.
+  </Step>
+
+  <Step title="Configure the build">
+    Run the configure script to probe your system and generate the final `Makefile`:
+
+    ```bash
+    ./configure
+    ```
+
+    By default, configure auto-detects epoll (Linux) or kqueue (BSD/macOS), endianness, and optional features. See [Configure options](#configure-options) below to enable or disable specific features.
+  </Step>
+
+  <Step title="Compile">
+    Build the library. The single-threaded form is the safest baseline:
+
+    ```bash
+    make
+    ```
+
+    To speed up compilation, pass `-j` with a thread count. The optimal number is **one less than your CPU core count**—this leaves one core free for the OS and keeps the machine responsive:
+
+    ```bash
+    # 4-core machine → 3 jobs; 8-core machine → 7 jobs
+    make -j3
+    ```
+
+    <Tip>
+      Run `nproc` to print your core count, then subtract one: `make -j$(( $(nproc) - 1 ))`.
+    </Tip>
+  </Step>
+
+  <Step title="Install">
+    Install the shared library and headers to your system prefix (default `/usr/local`):
+
+    ```bash
+    sudo make install
+    ```
+
+    This installs:
+    - `libdir/libtorrent.so` — the shared library
+    - `includedir/torrent/` — the public headers
+    - `libdir/pkgconfig/libtorrent.pc` — the pkg-config metadata file
+  </Step>
+</Steps>
+
+## Verify the installation
+
+After installing, confirm that pkg-config can find libTorrent and report its version:
+
+```bash
+pkg-config --modversion libtorrent
+```
+
+You should see `0.16.9`. To get the full compiler and linker flags for your own build:
+
+```bash
+pkg-config --cflags --libs libtorrent
+```
+
+Example output:
+
+```
+-I/usr/local/include -L/usr/local/lib -ltorrent
+```
+
+## Configure options
+
+Pass these flags to `./configure` before building. You can combine multiple flags in a single invocation.
+
+### Debug build
+
+Enable assertions and debug symbols. Use this during development:
+
+```bash
+./configure --enable-debug
+```
+
+### Endianness override
+
+Configure auto-detects endianness. If cross-compiling, you can override it:
+
+```bash
+# Force little-endian
+./configure --enable-little-endian
+
+# Force big-endian
+./configure --enable-big-endian
+```
+
+### Poll mechanism
+
+libTorrent requires at least one of epoll (Linux) or kqueue (BSD/macOS). Both are enabled by auto-detection. If you need to disable one explicitly:
+
+```bash
+# Disable epoll (falls back to kqueue on supported platforms)
+./configure --without-epoll
+
+# Disable kqueue
+./configure --without-kqueue
+```
+
+<Warning>
+  At least one of epoll or kqueue must be available. Configure will exit with an error if neither is enabled.
+</Warning>
+
+### Fallocate
+
+Pre-allocating file space with `fallocate` reduces fragmentation on download start. Configure detects both the Linux `fallocate` syscall and POSIX `posix_fallocate`. To enable file pre-allocation explicitly:
+
+```bash
+./configure --with-posix-fallocate
+```
+
+To opt out entirely:
+
+```bash
+./configure --without-fallocate
+```
+
+### Address space reservation
+
+libTorrent can reserve a contiguous virtual address space region for mmap I/O. This reduces mapping overhead on large torrents. Enable it with:
+
+```bash
+./configure --with-address-space=SIZE
+```
+
+Where `SIZE` is in bytes. Omit the flag to use the compiled default.

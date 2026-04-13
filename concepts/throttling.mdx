@@ -1,0 +1,168 @@
+---
+title: "Bandwidth Throttling in libTorrent"
+description: "Configure global, per-download, and per-address bandwidth limits using libTorrent's Throttle API, slave throttles, and the ConnectionManager address slot."
+---
+
+libTorrent provides a three-tier throttling architecture. **Global throttles** cap total upload and download bandwidth across all downloads. **Per-download throttles** let you give individual downloads their own rate limits. **Per-address throttles** let you apply different limits to peers depending on their IP address—useful for LAN versus WAN traffic.
+
+## The Throttle class
+
+`Throttle` objects are allocated with a factory function and must be destroyed explicitly:
+
+```cpp
+torrent::Throttle* upload_throttle = torrent::Throttle::create_throttle();
+torrent::Throttle* download_throttle = torrent::Throttle::create_throttle();
+
+// When done (e.g., on shutdown):
+torrent::Throttle::destroy_throttle(upload_throttle);
+torrent::Throttle::destroy_throttle(download_throttle);
+```
+
+### Setting the rate limit
+
+`max_rate` is in bytes per second. Set it to `0` for unlimited:
+
+```cpp
+upload_throttle->set_max_rate(512 * 1024);  // 512 KB/s
+download_throttle->set_max_rate(2 * 1024 * 1024); // 2 MB/s
+
+upload_throttle->set_max_rate(0); // unlimited
+
+uint64_t limit     = upload_throttle->max_rate();
+bool is_throttled  = upload_throttle->is_throttled(); // false when max_rate == 0
+const torrent::Rate* current = upload_throttle->rate();
+```
+
+### Slave throttles
+
+A slave throttle shares the same token bucket as its parent. Create one when you want a sub-limit that still respects a parent cap:
+
+```cpp
+// Both the parent and slave draw from the same pool.
+torrent::Throttle* slave = upload_throttle->create_slave();
+```
+
+<Warning>
+  Destroy all slaves before destroying the parent throttle. The parent does not manage slave lifetime.
+</Warning>
+
+## Global throttles
+
+libTorrent creates two global throttles at initialisation. Use them to cap all traffic across every download:
+
+```cpp
+torrent::Throttle* global_down = torrent::down_throttle_global();
+torrent::Throttle* global_up   = torrent::up_throttle_global();
+
+global_up->set_max_rate(1024 * 1024);   // 1 MB/s upload cap globally
+global_down->set_max_rate(4 * 1024 * 1024); // 4 MB/s download cap globally
+```
+
+Read the aggregate observed rates (read-only; these reflect actual throughput):
+
+```cpp
+const torrent::Rate* total_down = torrent::down_rate();
+const torrent::Rate* total_up   = torrent::up_rate();
+```
+
+## Per-download throttles
+
+Assign a throttle to a specific download to limit only that transfer:
+
+```cpp
+download.set_upload_throttle(upload_throttle);
+download.set_download_throttle(download_throttle);
+
+// Remove per-download limits (fall back to global throttle).
+download.set_upload_throttle(nullptr);
+download.set_download_throttle(nullptr);
+```
+
+<Tip>
+  Use a slave throttle here when you want a download to share bandwidth headroom with its parent throttle rather than getting an independent allocation.
+</Tip>
+
+## Per-address throttles
+
+Assign different throttle pairs based on peer IP address using the `address_throttle` slot on `ConnectionManager`. Return `{nullptr, nullptr}` to fall through to the download's or global throttle:
+
+```cpp
+torrent::Throttle* lan_up   = torrent::Throttle::create_throttle();
+torrent::Throttle* lan_down = torrent::Throttle::create_throttle();
+lan_up->set_max_rate(0);   // unlimited for LAN peers
+lan_down->set_max_rate(0);
+
+torrent::connection_manager()->address_throttle() =
+    [&](const sockaddr* sa) -> torrent::ThrottlePair {
+        if (is_lan_address(sa))
+            return {lan_up, lan_down};
+        return {nullptr, nullptr}; // use download / global throttle
+    };
+```
+
+`ThrottlePair` is `std::pair<Throttle*, Throttle*>` — first is upload, second is download.
+
+## Upload and download slot limits
+
+Alongside bandwidth rate limits, you can control how many simultaneous upload and download slots a download uses:
+
+```cpp
+download.set_uploads_max(4);   // unchoke at most 4 peers for upload
+download.set_uploads_min(1);   // always keep at least 1 upload slot open
+
+download.set_downloads_max(4); // request from at most 4 peers
+download.set_downloads_min(1); // keep at least 1 download slot open
+
+uint32_t max_ul = download.uploads_max();
+uint32_t min_ul = download.uploads_min();
+uint32_t max_dl = download.downloads_max();
+uint32_t min_dl = download.downloads_min();
+```
+
+## Complete example
+
+```cpp
+#include <torrent/torrent.h>
+#include <torrent/throttle.h>
+#include <torrent/download.h>
+#include <torrent/connection_manager.h>
+
+// 1. Create throttles.
+torrent::Throttle* up   = torrent::Throttle::create_throttle();
+torrent::Throttle* down = torrent::Throttle::create_throttle();
+
+// 2. Set global caps.
+torrent::up_throttle_global()->set_max_rate(2ULL * 1024 * 1024);   // 2 MB/s
+torrent::down_throttle_global()->set_max_rate(10ULL * 1024 * 1024); // 10 MB/s
+
+// 3. Give one download tighter limits via a slave throttle.
+torrent::Throttle* dl_slave = down->create_slave();
+dl_slave->set_max_rate(512 * 1024); // this download capped at 512 KB/s
+
+download.set_upload_throttle(up);
+download.set_download_throttle(dl_slave);
+
+// 4. Unlimited bandwidth for LAN peers.
+torrent::Throttle* lan_up   = torrent::Throttle::create_throttle();
+torrent::Throttle* lan_down = torrent::Throttle::create_throttle();
+lan_up->set_max_rate(0);
+lan_down->set_max_rate(0);
+
+torrent::connection_manager()->address_throttle() =
+    [&](const sockaddr* sa) -> torrent::ThrottlePair {
+        return is_lan_address(sa)
+            ? torrent::ThrottlePair{lan_up, lan_down}
+            : torrent::ThrottlePair{nullptr, nullptr};
+    };
+
+// 5. Slot limits.
+download.set_uploads_max(4);
+download.set_downloads_max(6);
+
+// On shutdown:
+torrent::Throttle::destroy_throttle(dl_slave);
+torrent::Throttle::destroy_throttle(up);
+torrent::Throttle::destroy_throttle(down);
+torrent::Throttle::destroy_throttle(lan_up);
+torrent::Throttle::destroy_throttle(lan_down);
+```

@@ -1,0 +1,239 @@
+---
+title: "File Management and Priorities"
+description: "Control per-file download priorities, inspect file metadata, manage paths, and iterate the file list for any torrent in libTorrent."
+---
+
+Every torrent in libTorrent exposes its constituent files through a `FileList` — a vector-like container of `File` objects. You access it via `Download::file_list()` and use it to read file metadata, set priorities, and manage on-disk paths. This page covers the complete `File` and `FileList` API.
+
+## Accessing the file list
+
+```cpp
+torrent::FileList* fl = dl.file_list();
+
+// Basic stats
+size_t   num_files    = fl->size_files();
+uint64_t total_bytes  = fl->size_bytes();
+uint32_t total_chunks = fl->size_chunks();
+uint32_t done_chunks  = fl->completed_chunks();
+uint64_t done_bytes   = fl->completed_bytes();
+uint64_t left_bytes   = fl->left_bytes();
+```
+
+The `FileList` exposes standard begin/end iterators, so you can use range-for:
+
+```cpp
+for (auto& file_ptr : *fl) {
+  torrent::File* f = file_ptr.get();
+  // ...
+}
+```
+
+## File metadata
+
+Each `File` exposes byte-level and chunk-level positioning:
+
+```cpp
+torrent::File* f = fl->at(0).get();
+
+uint64_t byte_offset    = f->offset();         // byte offset within the torrent
+uint64_t size_bytes     = f->size_bytes();
+uint32_t size_chunks    = f->size_chunks();    // range_second - range_first
+uint32_t done_chunks    = f->completed_chunks();
+
+// Chunk range [first, second)
+const torrent::File::range_type& r = f->range();
+uint32_t first = f->range_first();
+uint32_t second = f->range_second();
+```
+
+Check whether a byte position falls inside this file:
+
+```cpp
+bool inside = f->is_valid_position(byte_offset);
+```
+
+## File state
+
+```cpp
+bool created   = f->is_created();         // file exists on disk
+bool open      = f->is_open();            // file descriptor is open (fd != -1)
+bool correct   = f->is_correct_size();    // on-disk size matches expected
+bool queued_c  = f->is_create_queued();   // waiting to be created
+bool queued_r  = f->is_resize_queued();   // waiting to be resized
+bool padding   = f->is_padding();         // padding file (V2 torrents)
+bool prev_seen = f->is_previously_created(); // file existed in a prior session
+```
+
+## File flags
+
+<AccordionGroup>
+  <Accordion title="flag_active (1 << 0)">
+    Set internally when the file is actively being used for I/O. Not settable by the client.
+  </Accordion>
+  <Accordion title="flag_create_queued (1 << 1)">
+    The file is queued for creation. Set this flag to request that libTorrent create the file on disk.
+  </Accordion>
+  <Accordion title="flag_resize_queued (1 << 2)">
+    The file is queued for a resize operation.
+  </Accordion>
+  <Accordion title="flag_fallocate (1 << 3)">
+    Use `fallocate(2)` to pre-allocate disk space for this file when it is created. Also controllable globally via `Download::open_enable_fallocate`.
+  </Accordion>
+  <Accordion title="flag_previously_created (1 << 4)">
+    Set internally to indicate the file was present at a previous session. Read-only.
+  </Accordion>
+  <Accordion title="flag_prioritize_first (1 << 5)">
+    Prioritize the first chunk of this file. Useful for streaming — ensures the beginning of a file is downloaded first.
+  </Accordion>
+  <Accordion title="flag_prioritize_last (1 << 6)">
+    Prioritize the last chunk. Also useful for streaming so media players can read duration/index data.
+  </Accordion>
+  <Accordion title="flag_attr_padding (1 << 7)">
+    Marks this entry as a padding file. libTorrent ignores padding files during download.
+  </Accordion>
+</AccordionGroup>
+
+Set or clear client-settable flags:
+
+```cpp
+f->set_flags(torrent::File::flag_prioritize_first | torrent::File::flag_fallocate);
+f->unset_flags(torrent::File::flag_prioritize_first);
+bool has = f->has_flags(torrent::File::flag_fallocate);
+```
+
+<Note>
+`flag_active` and `flag_previously_created` are managed by libTorrent internally and cannot be set via the public `set_flags` / `unset_flags` methods.
+</Note>
+
+## File priority
+
+Priority controls whether libTorrent downloads the chunks belonging to this file:
+
+```cpp
+torrent::priority_enum p = f->priority();
+f->set_priority(torrent::PRIORITY_OFF);     // 0 — skip this file
+f->set_priority(torrent::PRIORITY_NORMAL);  // 1 — default
+f->set_priority(torrent::PRIORITY_HIGH);    // 2 — prefer this file
+```
+
+After modifying priorities you **must** call `update_priorities()` on the `Download` so that libTorrent re-evaluates peer interest across all connected peers:
+
+```cpp
+dl.update_priorities();
+```
+
+This call is slightly expensive because it walks every peer's bitfield, so batch your priority changes before calling it.
+
+### Example: skip all files except one
+
+```cpp
+torrent::FileList* fl = dl.file_list();
+
+for (auto& fp : *fl)
+  fp->set_priority(torrent::PRIORITY_OFF);
+
+fl->at(2)->set_priority(torrent::PRIORITY_HIGH);
+
+dl.update_priorities();
+```
+
+## File path
+
+Each file has a mutable `Path` (a vector of path components) and an immutable frozen path:
+
+```cpp
+const torrent::Path* path   = f->path();            // current path
+torrent::Path*       mpath  = f->mutable_path();    // modify before opening
+const std::string&   frozen = f->frozen_path();     // original path from torrent
+```
+
+The `Path` class exposes the same interface as `std::vector<std::string>`, plus helpers:
+
+```cpp
+std::string full = path->as_string();  // joined with '/'
+
+// Read encoding preference for this file's path
+std::string enc = path->encoding();
+path->set_encoding("UTF-8");
+```
+
+<Warning>
+File paths can only be changed while the download is in the **closed** state. Modifying paths on an open download has no effect and may produce inconsistent results.
+</Warning>
+
+## Root directory
+
+The root directory is prepended to all file paths when opening files on disk:
+
+```cpp
+const std::string& root = fl->root_dir();
+fl->set_root_dir("/data/torrents/my-torrent");
+```
+
+For single-file torrents the default root is `./`; for multi-file torrents it is `./[torrent_name]/`.
+
+<Note>
+Call `set_root_dir` only after all file entries have been added (i.e., after `download_add` returns). You must also call it before `open()`.
+</Note>
+
+## Directory matching depth
+
+Two fields on `File` help UIs render a tree structure by describing how much of the path it shares with its neighbours:
+
+```cpp
+uint32_t shared_with_prev = f->match_depth_prev();
+uint32_t shared_with_next = f->match_depth_next();
+```
+
+A value of `0` means no shared path components; higher values indicate deeper shared directory prefixes.
+
+## File permissions and descriptor
+
+```cpp
+bool readable   = f->has_permissions(PROT_READ);
+bool writable   = f->has_permissions(PROT_WRITE);
+int  prot_flags = f->protection();
+
+int fd = f->file_descriptor();  // -1 when not open
+```
+
+## Permissions
+
+```cpp
+bool readable = f->has_permissions(PROT_READ);
+bool writable = f->has_permissions(PROT_WRITE);
+int prot = f->protection();    // combined protection flags
+```
+
+## Iterating files as a directory tree
+
+Use `FileListIterator` for depth-aware traversal:
+
+```cpp
+#include <torrent/data/file_list_iterator.h>
+
+torrent::FileListIterator it(fl->begin());
+torrent::FileListIterator end(fl->end());
+
+for (; it != end; ++it) {
+  if (it.is_entering()) {
+    // entering a subdirectory at depth it.depth()
+  } else if (it.is_leaving()) {
+    // leaving a subdirectory
+  } else if (it.is_file()) {
+    torrent::File* f = it.file();
+    // process file
+  }
+}
+```
+
+For navigating only at a fixed depth use `file_list_collapsed_iterator`:
+
+```cpp
+torrent::file_list_collapsed_iterator cit(fl->begin(), 0);
+torrent::file_list_collapsed_iterator cend(fl->end(), 0);
+
+for (; cit != cend; ++cit) {
+  // visits only top-level entries
+}
+```

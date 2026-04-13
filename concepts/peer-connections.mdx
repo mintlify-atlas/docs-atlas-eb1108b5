@@ -1,0 +1,208 @@
+---
+title: "Peer Connections and the Connection Manager"
+description: "Explore how libTorrent manages connections globally via ConnectionManager and per-peer via the Peer class, including choke state, filtering, and PEX."
+---
+
+libTorrent separates peer management into two layers. The `ConnectionManager` singleton enforces global socket limits and provides hooks for address filtering and per-address throttling. Individual connections are represented by `Peer` objects that expose choke state, transfer rates, bitfields, and controls like snubbing and banning.
+
+## ConnectionManager
+
+Access the singleton via:
+
+```cpp
+torrent::ConnectionManager* cm = torrent::connection_manager();
+```
+
+### Socket limits
+
+```cpp
+// Maximum number of open sockets (0 = no limit).
+cm->set_max_size(200);
+uint32_t limit   = cm->max_size();
+uint32_t current = cm->size();          // current open socket count
+
+// Check whether a new outgoing connection is allowed.
+bool allowed = cm->can_connect();
+
+// The library calls these automatically; call them yourself only
+// when you open or close sockets outside libTorrent.
+cm->inc_socket_count();
+cm->dec_socket_count();
+```
+
+### Address filtering
+
+Provide a callable that receives a `sockaddr*` and returns a `uint32_t` bitmask. Returning a non-zero value blocks the connection:
+
+```cpp
+cm->set_filter([](const sockaddr* sa) -> uint32_t {
+    // Return 0 to allow, non-zero to block.
+    return is_blocked(sa) ? 1 : 0;
+});
+
+// Query the filter directly.
+uint32_t result = cm->filter(peer_addr);
+```
+
+### Per-address throttles
+
+Assign independent upload/download throttle pairs to specific peer addresses. Return `{nullptr, nullptr}` to fall back to the global throttle:
+
+```cpp
+cm->address_throttle() = [](const sockaddr* sa) -> torrent::ThrottlePair {
+    if (is_lan_address(sa))
+        return {lan_up_throttle, lan_down_throttle};
+    return {nullptr, nullptr}; // use default throttle
+};
+```
+
+`ThrottlePair` is `std::pair<Throttle*, Throttle*>` where the first element is the upload throttle and the second is the download throttle.
+
+## Handshake states
+
+The `ConnectionManager` also defines the handshake state constants used in connection lifecycle callbacks:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `handshake_incoming`           | 1 | Inbound connection being negotiated. |
+| `handshake_outgoing`           | 2 | Outbound plaintext handshake in progress. |
+| `handshake_outgoing_encrypted` | 3 | Outbound encrypted handshake in progress. |
+| `handshake_outgoing_proxy`     | 4 | Outbound connection via proxy. |
+| `handshake_success`            | 5 | Handshake completed successfully. |
+| `handshake_dropped`            | 6 | Connection dropped before completion. |
+| `handshake_failed`             | 7 | Handshake failed. |
+| `handshake_retry_plaintext`    | 8 | Retrying with plaintext after encrypted attempt. |
+| `handshake_retry_encrypted`    | 9 | Retrying with encryption after plaintext attempt. |
+
+## The Peer class
+
+`Peer` objects are owned by the download's `ConnectionList`. They are valid only until the next `torrent::work()` call removes them, so always listen to `ConnectionList::signal_disconnected()` to invalidate stale pointers.
+
+### Connection properties
+
+```cpp
+bool incoming   = peer->is_incoming();    // true for inbound connections
+bool encrypted  = peer->is_encrypted();   // MSE/PE encryption active
+bool obfuscated = peer->is_obfuscated();  // header obfuscation active
+
+const sockaddr*   addr = peer->address();
+const HashString& id   = peer->id();
+```
+
+### Choke state
+
+```cpp
+// Upload direction (us → peer).
+bool up_choked     = peer->is_up_choked();      // we are choking the peer
+bool up_interested = peer->is_up_interested();  // peer wants data from us
+
+// Download direction (peer → us).
+bool down_choked     = peer->is_down_choked();    // peer is choking us
+bool down_queued     = peer->is_down_queued();    // we are in peer's unchoke queue
+bool down_interested = peer->is_down_interested(); // we want data from peer
+```
+
+### Snubbing and banning
+
+Snubbing marks a peer as uncooperative without disconnecting. Banning prevents reconnection:
+
+```cpp
+if (peer->down_rate()->rate() < min_rate)
+    peer->set_snubbed(true);
+
+if (peer->failed_counter() > max_failures)
+    peer->set_banned(true);
+
+bool snubbed = peer->is_snubbed();
+bool banned  = peer->is_banned();
+```
+
+### Transfer rates
+
+```cpp
+const torrent::Rate* dl   = peer->down_rate();  // bytes received from peer
+const torrent::Rate* ul   = peer->up_rate();    // bytes sent to peer
+const torrent::Rate* peer_rate = peer->peer_rate(); // peer's own reported rate
+```
+
+### Bitfield and queues
+
+```cpp
+const torrent::Bitfield* bf = peer->bitfield(); // chunks the peer has
+
+const torrent::BlockTransfer* active = peer->transfer(); // in-flight block
+
+uint32_t incoming = peer->incoming_queue_size(); // blocks we requested
+uint32_t outgoing = peer->outgoing_queue_size(); // blocks peer requested
+uint32_t done     = peer->chunks_done();         // chunks verified from peer
+```
+
+### Disconnecting
+
+Pass flags from `ConnectionList` to control how the disconnect is handled:
+
+```cpp
+peer->disconnect(torrent::ConnectionList::disconnect_quick);
+```
+
+| Flag | Value | Meaning |
+|------|-------|---------|
+| `disconnect_available` | `1 << 0` | Peer remains available for reconnection. |
+| `disconnect_quick`     | `1 << 1` | Close the socket immediately without graceful shutdown. |
+| `disconnect_unwanted`  | `1 << 2` | Mark peer as unwanted; deprioritise for reconnection. |
+| `disconnect_delayed`   | `1 << 3` | Queue the disconnect to happen after the current work cycle. |
+
+## ConnectionList
+
+Each download exposes its active peer list via `Download::connection_list()`:
+
+```cpp
+torrent::ConnectionList* cl = download.connection_list();
+
+// Iterate active peers.
+for (torrent::Peer* peer : *cl) {
+    // ...
+}
+
+// React to peers connecting and disconnecting.
+cl->signal_connected().push_back([](torrent::Peer* p) {
+    // new peer connected
+});
+cl->signal_disconnected().push_back([](torrent::Peer* p) {
+    // peer gone — invalidate any stored pointer to p
+});
+```
+
+Connection count limits per download:
+
+```cpp
+cl->set_min_size(10);   // try to maintain at least 10 peers
+cl->set_max_size(80);   // never exceed 80 simultaneous peers
+```
+
+## Peer Exchange (PEX)
+
+PEX lets connected peers share lists of other peers they know about. Toggle it per download:
+
+```cpp
+download.set_pex_enabled(true);
+
+uint32_t active_pex = download.size_pex();      // peers currently exchanging
+uint32_t pex_limit  = download.max_size_pex();  // maximum PEX peers
+```
+
+<Note>
+  PEX is disabled automatically for private torrents (`flag_private`). Calling `set_pex_enabled(true)` on a private download has no effect.
+</Note>
+
+## Adding peers manually
+
+Inject a peer address directly without waiting for a tracker response:
+
+```cpp
+sockaddr_in addr{};
+addr.sin_family = AF_INET;
+inet_pton(AF_INET, "203.0.113.5", &addr.sin_addr);
+
+download.add_peer(reinterpret_cast<const sockaddr*>(&addr), 6881);
+```

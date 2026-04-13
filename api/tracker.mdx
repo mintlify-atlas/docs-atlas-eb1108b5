@@ -1,0 +1,351 @@
+---
+title: "Tracker and TrackerControllerWrapper API Reference"
+description: "Inspect and control individual trackers, query tracker state and scrape data, and manage the full tracker controller for a download."
+---
+
+libTorrent's tracker subsystem lives in the `torrent::tracker` namespace. A `Tracker` is a lightweight handle to a single tracker endpoint (HTTP, UDP, or DHT). A `TrackerControllerWrapper` groups all trackers for one download and drives announcement logic. You access trackers through `TrackerControllerWrapper`, which is available from the `Download` object.
+
+```cpp
+#include <torrent/tracker/tracker.h>
+#include <torrent/tracker/wrappers.h>
+#include <torrent/tracker/tracker_state.h>
+#include <torrent/common.h>  // tracker_enum
+```
+
+---
+
+## tracker_enum
+
+The `tracker_enum` type identifies the protocol a tracker uses. It is defined in `<torrent/common.h>`.
+
+```cpp
+namespace torrent {
+
+enum tracker_enum {
+  TRACKER_NONE,
+  TRACKER_HTTP,
+  TRACKER_UDP,
+  TRACKER_DHT,
+};
+
+}
+```
+
+| Value | Description |
+|---|---|
+| `TRACKER_NONE` | No protocol; placeholder for invalid or uninitialized trackers. |
+| `TRACKER_HTTP` | HTTP/HTTPS announce endpoint. |
+| `TRACKER_UDP` | UDP tracker protocol (BEP 15). |
+| `TRACKER_DHT` | DHT-based peer discovery (BEP 5). |
+
+---
+
+## Tracker
+
+`Tracker` is a non-owning handle backed by a `shared_ptr<TrackerWorker>`. Two `Tracker` instances are equal when they share the same internal worker. A default-constructed `Tracker` has `is_valid() == false`.
+
+```cpp
+namespace torrent::tracker {
+
+class Tracker {
+public:
+  bool is_valid()             const;
+  bool is_busy()              const;
+  bool is_busy_not_scrape()   const;
+  bool is_enabled()           const;
+  bool is_extra_tracker()     const;
+  bool is_in_use()            const;
+  bool is_usable()            const;
+  bool is_scrapable()         const;
+  bool can_request_state()    const;
+
+  void enable();
+  void disable();
+
+  torrent::tracker_enum   type()        const;
+  const std::string&      url()         const;
+  std::string             tracker_id()  const;
+  uint32_t                group()       const;
+  TrackerState            state()       const;
+  std::string             status()      const;
+
+  void lock_and_call_state(const std::function<void(const TrackerState&)>& f) const;
+
+  bool operator< (const Tracker& rhs) const;
+  bool operator==(const Tracker& rhs) const;
+};
+
+}
+```
+
+### State queries
+
+| Method | Returns | Description |
+|---|---|---|
+| `is_valid() const` | `bool` | `true` when the internal worker pointer is non-null. Always check this before using a `Tracker` returned by search functions. |
+| `is_busy() const` | `bool` | `true` when an announce or scrape request is in flight. |
+| `is_busy_not_scrape() const` | `bool` | `true` when an announce (non-scrape) request is in flight. |
+| `is_enabled() const` | `bool` | `true` when the tracker has the `flag_enabled` flag set in its state. |
+| `is_extra_tracker() const` | `bool` | `true` when this tracker was added via `add_extra_tracker()` rather than from the torrent's announce list. |
+| `is_in_use() const` | `bool` | `true` when the tracker is enabled and has at least one successful announce. |
+| `is_usable() const` | `bool` | `true` when the tracker is enabled and can potentially be contacted. |
+| `is_scrapable() const` | `bool` | `true` when the tracker supports the scrape extension. |
+| `can_request_state() const` | `bool` | `true` when a new announce request can be queued right now. |
+
+### Control
+
+| Method | Description |
+|---|---|
+| `enable()` | Enables this tracker. It will be contacted in the next announce cycle. |
+| `disable()` | Disables this tracker. Outstanding requests are allowed to complete. |
+
+### Info
+
+| Method | Returns | Description |
+|---|---|---|
+| `type() const` | `torrent::tracker_enum` | Protocol type: `TRACKER_HTTP`, `TRACKER_UDP`, or `TRACKER_DHT`. |
+| `url() const` | `const std::string&` | The announce URL for this tracker. |
+| `tracker_id() const` | `std::string` | The tracker ID returned by the server in a previous response, if any. |
+| `group() const` | `uint32_t` | The announce tier group this tracker belongs to (from the torrent's multi-tracker list). |
+| `state() const` | `TrackerState` | Returns a snapshot copy of the current `TrackerState`. Safe to read without locking, but may not reflect in-flight changes. |
+| `status() const` | `std::string` | Human-readable description of the tracker's current status, suitable for display. |
+| `lock_and_call_state(f) const` | `void` | Calls `f` with a const reference to the live `TrackerState` under an internal lock. Use this when you need a consistent, up-to-date view of the state from a background thread. |
+
+### Comparison
+
+`Tracker` objects compare by internal worker pointer identity.
+
+```cpp
+bool operator< (const Tracker& rhs) const;  // ordering by pointer for use in sorted containers
+bool operator==(const Tracker& rhs) const;  // identity check
+```
+
+---
+
+## TrackerState
+
+`TrackerState` holds the persistent runtime statistics for a single tracker. You obtain a snapshot via `Tracker::state()` or access the live value via `Tracker::lock_and_call_state()`.
+
+```cpp
+namespace torrent::tracker {
+
+class TrackerState {
+public:
+  enum event_enum {
+    EVENT_NONE,
+    EVENT_COMPLETED,
+    EVENT_STARTED,
+    EVENT_STOPPED,
+    EVENT_SCRAPE
+  };
+
+  static constexpr int flag_enabled       = 0x1;
+  static constexpr int flag_extra_tracker = 0x2;
+  static constexpr int flag_scrapable     = 0x4;
+
+  static constexpr int default_min_interval    = 600;
+  static constexpr int min_min_interval        = 300;
+  static constexpr int max_min_interval        = 4 * 3600;
+  static constexpr int default_normal_interval = 1800;
+  static constexpr int min_normal_interval     = 600;
+  static constexpr int max_normal_interval     = 8 * 3600;
+
+  int        flags()                const;
+  bool       is_enabled()           const;
+  bool       is_extra_tracker()     const;
+  bool       is_in_use()            const;
+  bool       is_scrapable()         const;
+
+  uint32_t   normal_interval()      const;
+  uint32_t   min_interval()         const;
+
+  event_enum latest_event()         const;
+  uint32_t   latest_new_peers()     const;
+  uint32_t   latest_sum_peers()     const;
+
+  uint32_t   success_time_next()    const;
+  uint32_t   success_time_last()    const;
+  uint32_t   success_counter()      const;
+
+  uint32_t   failed_time_next()     const;
+  uint32_t   failed_time_last()     const;
+  uint32_t   failed_counter()       const;
+
+  uint32_t   activity_time_last()   const;
+  uint32_t   activity_time_next()   const;
+
+  uint32_t   scrape_time_last()     const;
+  uint32_t   scrape_counter()       const;
+  uint32_t   scrape_complete()      const;
+  uint32_t   scrape_incomplete()    const;
+  uint32_t   scrape_downloaded()    const;
+};
+
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Flags and event types">
+    | Constant | Value | Meaning |
+    |---|---|---|
+    | `flag_enabled` | `0x1` | Tracker is enabled for announces. |
+    | `flag_extra_tracker` | `0x2` | Added as an extra tracker after load. |
+    | `flag_scrapable` | `0x4` | Tracker URL supports the scrape convention. |
+
+    | `event_enum` | Meaning |
+    |---|---|
+    | `EVENT_NONE` | No event pending. |
+    | `EVENT_COMPLETED` | Download completed event. |
+    | `EVENT_STARTED` | Announce on start. |
+    | `EVENT_STOPPED` | Announce on stop. |
+    | `EVENT_SCRAPE` | Scrape request (not an announce). |
+  </Accordion>
+  <Accordion title="Intervals">
+    | Field | Default | Clamp range | Description |
+    |---|---|---|---|
+    | `normal_interval` | 1800 s | 600 – 28800 s | Preferred announce interval from the tracker. |
+    | `min_interval` | 600 s | 300 – 14400 s | Minimum interval between forced re-announces. |
+
+    `success_time_next()` returns `success_time_last + max(normal_interval, 600)`. `failed_time_next()` uses exponential back-off capped at `min_interval`.
+  </Accordion>
+  <Accordion title="Success and failure counters">
+    | Method | Description |
+    |---|---|
+    | `success_counter()` | Total successful announces since the last `clear_stats()`. |
+    | `success_time_last()` | Unix timestamp of the last successful announce. |
+    | `success_time_next()` | Unix timestamp of the next scheduled announce. |
+    | `failed_counter()` | Number of consecutive failures since the last success. |
+    | `failed_time_last()` | Unix timestamp of the most recent failure. |
+    | `failed_time_next()` | Unix timestamp of the next retry after a failure (back-off applied). |
+    | `activity_time_last()` | Most recent of `success_time_last` and `failed_time_last`. |
+    | `activity_time_next()` | Next scheduled contact time, accounting for failure state. |
+  </Accordion>
+  <Accordion title="Scrape data">
+    | Method | Description |
+    |---|---|
+    | `scrape_counter()` | Total scrape responses received. |
+    | `scrape_time_last()` | Unix timestamp of the last scrape. |
+    | `scrape_complete()` | Number of peers that have completed the torrent (seeders). |
+    | `scrape_incomplete()` | Number of peers currently downloading (leechers). |
+    | `scrape_downloaded()` | Total number of times the torrent has been downloaded. |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## TrackerControllerWrapper
+
+`TrackerControllerWrapper` wraps the full tracker controller for a single download. It exposes the announce and scrape lifecycle and provides iteration over all configured trackers. Access it from `Download::tracker_controller()`.
+
+```cpp
+namespace torrent::tracker {
+
+class TrackerControllerWrapper {
+public:
+  bool is_valid()                    const;
+  bool is_active()                   const;
+  bool is_requesting()               const;
+  bool is_failure_mode()             const;
+  bool is_promiscuous_mode()         const;
+
+  bool has_active_trackers()         const;
+  bool has_active_trackers_not_scrape() const;
+  bool has_usable_trackers()         const;
+
+  const HashString& info_hash()      const;
+  uint32_t          key()            const;
+
+  int32_t  numwant()                 const;
+  void     set_numwant(int32_t n);
+
+  uint32_t size()                    const;
+  Tracker  at(uint32_t index)        const;
+
+  void     add_extra_tracker(uint32_t group, const std::string& url);
+
+  uint32_t seconds_to_next_timeout() const;
+  uint32_t seconds_to_next_scrape()  const;
+
+  void     manual_request(bool request_now);
+  void     scrape_request(uint32_t seconds_to_request);
+
+  void     cycle_group(uint32_t group);
+
+  // Iteration
+  Tracker  find_if(const std::function<bool(Tracker&)>& f);
+  void     for_each(const std::function<void(Tracker&)>& f);
+  Tracker  c_find_if(const std::function<bool(const Tracker&)>& f) const;
+  void     c_for_each(const std::function<void(const Tracker&)>& f) const;
+
+  bool operator<(const TrackerControllerWrapper& rhs) const;
+};
+
+}
+```
+
+### Status queries
+
+| Method | Returns | Description |
+|---|---|---|
+| `is_valid() const` | `bool` | `true` when the internal controller pointer is non-null. |
+| `is_active() const` | `bool` | `true` when the controller is started and sending announces. |
+| `is_requesting() const` | `bool` | `true` when a request cycle is currently running. |
+| `is_failure_mode() const` | `bool` | `true` when all trackers have failed and the controller is in back-off mode. |
+| `is_promiscuous_mode() const` | `bool` | `true` when the controller is contacting all tiers simultaneously rather than in sequence. |
+| `has_active_trackers() const` | `bool` | `true` when at least one tracker (announce or scrape) is busy. |
+| `has_active_trackers_not_scrape() const` | `bool` | `true` when at least one announce request is in flight. |
+| `has_usable_trackers() const` | `bool` | `true` when at least one tracker is enabled and reachable. |
+
+### Configuration
+
+| Method | Returns | Description |
+|---|---|---|
+| `info_hash() const` | `const HashString&` | The info-hash of the download this controller belongs to. |
+| `key() const` | `uint32_t` | Random key sent in HTTP announce requests for privacy. |
+| `numwant() const` | `int32_t` | Number of peers requested per announce. `-1` means use the tracker default. |
+| `set_numwant(int32_t n)` | `void` | Overrides the number of peers to request. |
+
+### Tracker access
+
+| Method | Returns | Description |
+|---|---|---|
+| `size() const` | `uint32_t` | Total number of configured trackers. |
+| `at(uint32_t index) const` | `Tracker` | Returns the tracker at position `index`. Bounds are not checked; always verify `index < size()`. |
+| `add_extra_tracker(uint32_t group, const std::string& url)` | `void` | Adds a tracker URL to the given tier group at runtime. The tracker is marked as an extra tracker. |
+
+### Timing
+
+| Method | Returns | Description |
+|---|---|---|
+| `seconds_to_next_timeout() const` | `uint32_t` | Seconds until the next scheduled announce timeout fires. |
+| `seconds_to_next_scrape() const` | `uint32_t` | Seconds until the next scheduled scrape. |
+
+### Request control
+
+| Method | Description |
+|---|---|
+| `manual_request(bool request_now)` | Triggers a manual announce. Pass `true` to fire immediately, `false` to queue at the soonest allowed time. |
+| `scrape_request(uint32_t seconds_to_request)` | Schedules a scrape to run in `seconds_to_request` seconds. Pass `0` for immediate. |
+| `cycle_group(uint32_t group)` | Rotates the active tracker within the specified tier group. |
+
+### Iteration
+
+```cpp
+// Visit every tracker
+wrapper.c_for_each([](const torrent::tracker::Tracker& t) {
+  std::cout << t.url() << " " << t.status() << "\n";
+});
+
+// Find the first HTTP tracker
+torrent::tracker::Tracker http =
+  wrapper.c_find_if([](const torrent::tracker::Tracker& t) {
+    return t.type() == torrent::TRACKER_HTTP;
+  });
+```
+
+| Method | Description |
+|---|---|
+| `for_each(f)` | Calls `f(Tracker&)` for every tracker. |
+| `find_if(f)` | Returns the first tracker for which `f` returns `true`. Returns an invalid `Tracker` if none match. |
+| `c_for_each(f)` | Const version of `for_each`. |
+| `c_find_if(f)` | Const version of `find_if`. |

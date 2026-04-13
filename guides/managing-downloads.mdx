@@ -1,0 +1,232 @@
+---
+title: "Managing Downloads with libTorrent"
+description: "Learn how to add, open, hash-check, start, stop, and remove downloads in libTorrent, covering the full download management lifecycle in C++."
+---
+
+libTorrent models every torrent as a `Download` handle — a lightweight, copyable pointer to internal state. You create a `Download` by passing a heap-allocated `Object` (parsed from a `.torrent` file) to `download_add`, then drive it through a sequence of states: closed → open → active. This page walks you through each step, from parsing the torrent file to cleaning up when you are done.
+
+## Parsing a torrent file
+
+The entry point for all torrent metadata is the `Object` class. Read a `.torrent` file into one using `object_read_bencode` from `<torrent/object_stream.h>`:
+
+```cpp
+#include <fstream>
+#include <torrent/object.h>
+#include <torrent/object_stream.h>
+
+torrent::Object* load_torrent(const std::string& path) {
+  std::ifstream file(path, std::ios::binary);
+  file.imbue(std::locale::classic());   // locale must be POSIX/C
+
+  auto* obj = new torrent::Object();
+  torrent::object_read_bencode(&file, obj);
+  return obj;   // caller owns this pointer
+}
+```
+
+<Warning>
+The stream locale must be set to POSIX or C before calling `object_read_bencode`. Passing a stream with a non-C locale produces undefined parsing results.
+</Warning>
+
+You can also use the extraction operator directly on a stream:
+
+```cpp
+torrent::Object obj;
+std::ifstream file("example.torrent", std::ios::binary);
+file.imbue(std::locale::classic());
+file >> obj;
+```
+
+## Adding a download
+
+Pass the heap-allocated `Object*` and a 32-bit tracker key to `download_add`:
+
+```cpp
+#include <torrent/torrent.h>
+
+torrent::Object* torrent_obj = load_torrent("example.torrent");
+uint32_t tracker_key = 12345;  // unique key identifying this client session
+
+torrent::Download dl = torrent::download_add(torrent_obj, tracker_key);
+```
+
+<Note>
+The `Object` **must** be heap-allocated with `new`. If `download_add` throws, you are responsible for deleting it. If it succeeds, ownership transfers to libTorrent and `download_remove` will free it.
+</Note>
+
+The `tracker_key` is embedded in tracker announce URLs so that the tracker can identify requests from this specific client session.
+
+## Opening a download
+
+After adding, the download is in the **closed** state. Call `open` to create and open all underlying files:
+
+```cpp
+dl.open();                              // default flags
+dl.open(torrent::Download::open_enable_fallocate);  // pre-allocate disk space
+```
+
+`open` throws `torrent::local_error` if the files cannot be opened. Once open, `dl.info()->is_open()` returns `true`.
+
+## Hash checking
+
+Before you can start downloading you need a valid bitfield of completed chunks. Call `hash_check`:
+
+```cpp
+bool done = dl.hash_check(false);  // full hash check
+```
+
+When `tryQuick` is `true`, the check stops as soon as it finds a chunk that can be memory-mapped (i.e., the file data already exists on disk). If no mappable chunks are found it returns `true` immediately and queues a hash-done signal. Use `tryQuick = true` for a fast resume path where you expect most data to be present; use `false` for a thorough first-time check.
+
+```cpp
+// Fast resume: assume most data is present
+bool finished = dl.hash_check(true);
+```
+
+You can poll progress with `dl.chunks_hashed()` and stop an in-progress check with `dl.hash_stop()`.
+
+## Setting resume data
+
+If you have saved a bitfield from a previous session, provide it before calling `hash_check` to skip re-verifying already-completed chunks. These calls are only valid when the download is open, not yet checked, and not currently checking:
+
+```cpp
+// Mark all chunks as complete (seeder starting up)
+dl.set_bitfield(true);
+
+// Restore from saved bitfield bytes
+dl.set_bitfield(resume_data_ptr, resume_data_ptr + resume_data_size);
+```
+
+After setting the bitfield, you can refine which ranges still need verification:
+
+```cpp
+// Mark chunks [100, 200) for re-check
+dl.update_range(torrent::Download::update_range_recheck, 100, 200);
+
+// Clear resume data for range [0, 50), forcing a full re-check there
+dl.update_range(torrent::Download::update_range_clear, 0, 50);
+```
+
+Both flags can be combined: `update_range_recheck | update_range_clear`.
+
+## Setting chunks done for closed torrents
+
+When a torrent is closed and you only need to track completion progress without opening files, use `set_chunks_done`:
+
+```cpp
+dl.set_chunks_done(completed_chunks, wanted_chunks);
+```
+
+## Starting and stopping
+
+With the download open and hash-checked, start it:
+
+```cpp
+dl.start();                                      // default: contact tracker, create peers
+dl.start(torrent::Download::start_skip_tracker); // skip initial tracker announce
+dl.start(torrent::Download::start_no_create);    // don't create missing files
+dl.start(torrent::Download::start_keep_baseline);// keep current upload baseline
+```
+
+To pause without closing:
+
+```cpp
+dl.stop();                                       // sends tracker stop event
+dl.stop(torrent::Download::stop_skip_tracker);   // stop without notifying tracker
+```
+
+<Tip>
+After calling `stop()`, libTorrent will make a tracker request to announce the stop. You do not need to wait for it before calling `close()`, but doing so lets the tracker know you are no longer available.
+</Tip>
+
+## Tracker lifecycle calls
+
+Send a completed event to all trackers when the download finishes:
+
+```cpp
+dl.send_completed();
+```
+
+Trigger an immediate tracker request:
+
+```cpp
+dl.manual_request(true);   // request right now
+dl.manual_request(false);  // request at next scheduled opportunity
+```
+
+Cancel a pending tracker request:
+
+```cpp
+dl.manual_cancel();
+```
+
+## Finding and listing downloads
+
+Look up an existing download by its 20-byte info-hash string:
+
+```cpp
+torrent::Download found = torrent::download_find(info_hash_string);
+if (!found.is_valid()) {
+  // Not found
+}
+```
+
+Iterate all registered downloads:
+
+```cpp
+torrent::DList downloads;
+torrent::download_list(downloads);  // appends to the list; clear it first
+
+for (auto& d : downloads) {
+  // process each Download
+}
+```
+
+<Warning>
+`download_list` **appends** to the list you pass in. Clear the list before calling it if you want a fresh snapshot.
+</Warning>
+
+## Download priority
+
+Priority controls how aggressively libTorrent's resource manager allocates upload and download slots to a given torrent relative to others:
+
+```cpp
+uint32_t pri = torrent::download_priority(dl);
+torrent::download_set_priority(dl, 2);  // higher = more resources
+```
+
+## Closing and removing
+
+Close a download to release file descriptors while keeping the handle registered:
+
+```cpp
+dl.close();
+```
+
+Remove the download entirely and free the associated `Object`:
+
+```cpp
+torrent::download_remove(dl);
+// dl is now invalid — do not use it
+```
+
+## Syncing chunks to disk
+
+Before saving resume data, flush completed chunks to ensure the bitfield reflects the on-disk state:
+
+```cpp
+dl.sync_chunks();
+```
+
+Call this immediately before writing resume data to disk to avoid marking chunks as complete that have not been flushed.
+
+## Filename encoding preferences
+
+libTorrent uses an `EncodingList` to determine which character encoding to use when interpreting file names embedded in a torrent:
+
+```cpp
+torrent::EncodingList* enc = torrent::encoding_list();
+enc->push_back("UTF-8");
+enc->push_back("ISO-8859-1");
+```
+
+Entries are tried in order. Add encodings that match the torrents you expect to handle.

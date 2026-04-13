@@ -1,0 +1,319 @@
+---
+title: "Download — Torrent Handle and Lifecycle Class Reference"
+description: "Full reference for the Download handle: lifecycle, hash checking, tracker control, peer management, file access, statistics, and download configuration."
+---
+
+`Download` is a lightweight handle — essentially a typed pointer — to an internal `DownloadWrapper` object managed by the library. It is safe to copy, assign, and destroy freely; destroying a `Download` handle does not remove the download from the library. You obtain a `Download` handle from `torrent::download_add()` or `torrent::download_find()`, and you release the underlying resources by calling `torrent::download_remove()`. All methods listed here are declared in `<torrent/download.h>`.
+
+<Note>
+  Always check `is_valid()` before calling any method on a `Download` obtained from `torrent::download_find()`. An invalid handle has a null internal pointer, and calling any other method on it causes undefined behavior.
+</Note>
+
+---
+
+## Static constants
+
+```cpp
+static constexpr uint32_t numwanted_diabled = ~uint32_t();
+
+static constexpr int open_enable_fallocate = (1 << 0);  // 0x01
+
+static constexpr int start_no_create       = (1 << 1);  // 0x02
+static constexpr int start_keep_baseline   = (1 << 2);  // 0x04
+static constexpr int start_skip_tracker    = (1 << 3);  // 0x08
+
+static constexpr int stop_skip_tracker     = (1 << 0);  // 0x01
+
+static constexpr int update_range_recheck  = (1 << 0);  // 0x01
+static constexpr int update_range_clear    = (1 << 1);  // 0x02
+```
+
+| Constant | Value | Description |
+|---|---|---|
+| `numwanted_diabled` | `~uint32_t()` | Pass to tracker `set_numwant` to disable the `numwant` field in announce requests. |
+| `open_enable_fallocate` | `1 << 0` | Passed to `open()`: pre-allocate disk space with `fallocate(2)` when opening files. |
+| `start_no_create` | `1 << 1` | Passed to `start()`: do not create missing files; fail if any output file is absent. |
+| `start_keep_baseline` | `1 << 2` | Passed to `start()`: preserve the current uploaded/completed baseline counters rather than resetting them. |
+| `start_skip_tracker` | `1 << 3` | Passed to `start()`: suppress the `started` tracker announce. |
+| `stop_skip_tracker` | `1 << 0` | Passed to `stop()`: suppress the `stopped` tracker announce. |
+| `update_range_recheck` | `1 << 0` | Passed to `update_range()`: mark the chunk range as needing a hash recheck. |
+| `update_range_clear` | `1 << 1` | Passed to `update_range()`: clear the completion bitfield for the chunk range. |
+
+---
+
+## Lifecycle
+
+```cpp
+void open(int flags = 0);
+void close(int flags = 0);
+void start(int flags = 0);
+void stop(int flags = 0);
+```
+
+| Method | Description |
+|---|---|
+| `open(int flags = 0)` | Opens and prepares the download's files on disk. Pass `open_enable_fallocate` to pre-allocate disk space. The download must be open before you call `start()`. |
+| `close(int flags = 0)` | Closes file handles and frees memory-mapped chunks. The download must be stopped before you close it. |
+| `start(int flags = 0)` | Activates the download: contacts trackers, accepts peer connections, and begins transferring data. Combine flags with bitwise-OR. |
+| `stop(int flags = 0)` | Deactivates the download. Pass `stop_skip_tracker` to avoid sending a `stopped` event to trackers — useful when you plan to resume immediately. |
+
+<Tip>
+  The typical lifecycle is: `open()` → `hash_check()` → `start()` → `stop()` → `close()`. You can omit `hash_check()` if you have reliable resume data already set via `set_bitfield()`.
+</Tip>
+
+---
+
+## State
+
+```cpp
+bool is_valid() const;
+bool is_hash_checked() const;
+bool is_hash_checking() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `is_valid() const` | `bool` | Returns `true` if the handle points to a live download. An invalid handle must not be used for any other method call. |
+| `is_hash_checked() const` | `bool` | Returns `true` after hash checking has successfully completed on all chunks. |
+| `is_hash_checking() const` | `bool` | Returns `true` while an async hash check is in progress. |
+
+---
+
+## Hash checking
+
+```cpp
+bool hash_check(bool tryQuick);
+void hash_stop();
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `hash_check(bool tryQuick)` | `bool` | Starts verifying piece hashes against downloaded data. When `tryQuick` is `true`, stops at the first chunk that cannot be memory-mapped and returns `true` (signaling that hash checking is done and a `hash_done` signal has been queued). Chunk ranges covered by valid resume data are skipped. Call this when `is_open()` is true and before `start()`. |
+| `hash_stop()` | `void` | Aborts an in-progress hash check. Safe to call even if no check is running. |
+
+---
+
+## Info access
+
+```cpp
+const DownloadInfo*  info() const;
+const download_data* data() const;
+
+Object*       bencode();
+const Object* bencode() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `info() const` | `const DownloadInfo*` | Returns the metadata object containing the download's name, info hash, rates, flags, and signals. See the [DownloadInfo reference](/api/download-info). |
+| `data() const` | `const download_data*` | Returns the raw data state object. |
+| `bencode()` | `Object*` | Returns a mutable pointer to the parsed bencode `Object` that backs this download. This is the same object you passed to `download_add()`. |
+| `bencode() const` | `const Object*` | Const overload of `bencode()`. |
+
+---
+
+## Trackers and peers
+
+```cpp
+tracker::TrackerControllerWrapper       tracker_controller();
+const tracker::TrackerControllerWrapper c_tracker_controller() const;
+
+PeerList*       peer_list();
+const PeerList* peer_list() const;
+
+ConnectionList*       connection_list();
+const ConnectionList* connection_list() const;
+
+bool accepting_new_peers() const;
+void add_peer(const sockaddr* addr, int port);
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `tracker_controller()` | `tracker::TrackerControllerWrapper` | Returns the mutable tracker controller wrapper for this download. Use it to query tracker state, set `numwant`, trigger manual announces, and iterate the tracker list. |
+| `c_tracker_controller() const` | `const tracker::TrackerControllerWrapper` | Const overload of `tracker_controller()`. |
+| `peer_list()` | `PeerList*` | Returns the peer list, which tracks known peer addresses for this download. |
+| `peer_list() const` | `const PeerList*` | Const overload. |
+| `connection_list()` | `ConnectionList*` | Returns the active connection list, representing currently connected peers. |
+| `connection_list() const` | `const ConnectionList*` | Const overload. |
+| `accepting_new_peers() const` | `bool` | Returns `true` when the download is willing to accept new incoming peer connections. |
+| `add_peer(const sockaddr* addr, int port)` | `void` | Manually injects a peer address for the download to connect to, bypassing tracker and DHT discovery. |
+
+---
+
+## File access
+
+```cpp
+FileList*           file_list() const;
+const TransferList* transfer_list() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `file_list() const` | `FileList*` | Returns the file list for this download. Use it to inspect individual files, set per-file priorities, and manage file paths. |
+| `transfer_list() const` | `const TransferList*` | Returns the transfer list, which describes the block-level transfer state for all pieces. |
+
+---
+
+## Statistics
+
+```cpp
+uint64_t       bytes_done() const;
+uint32_t       chunks_hashed() const;
+const uint8_t* chunks_seen() const;
+
+uint32_t       peers_complete() const;
+uint32_t       peers_accounted() const;
+uint32_t       peers_currently_unchoked() const;
+uint32_t       peers_currently_interested() const;
+
+uint32_t       size_pex() const;
+uint32_t       max_size_pex() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `bytes_done() const` | `uint64_t` | Total bytes of payload data that have been verified and written to disk. |
+| `chunks_hashed() const` | `uint32_t` | Number of chunks whose SHA-1 hash has been verified so far. |
+| `chunks_seen() const` | `const uint8_t*` | Pointer to a bitfield-style byte array indicating which chunks have been seen (offered by at least one peer). |
+| `peers_complete() const` | `uint32_t` | Number of peers that have reported having all pieces (seeders). |
+| `peers_accounted() const` | `uint32_t` | Total number of peers being tracked for this download. |
+| `peers_currently_unchoked() const` | `uint32_t` | Number of peers we are currently uploading to (unchoked). |
+| `peers_currently_interested() const` | `uint32_t` | Number of peers that have expressed interest in our data. |
+| `size_pex() const` | `uint32_t` | Current number of addresses in the PEX exchange list. |
+| `max_size_pex() const` | `uint32_t` | Maximum number of addresses allowed in the PEX exchange list. |
+
+---
+
+## Configuration
+
+### Resume data and bitfield
+
+```cpp
+void set_chunks_done(uint32_t chunks_done, uint32_t chunks_wanted);
+void set_bitfield(bool allSet);
+void set_bitfield(const uint8_t* first, const uint8_t* last);
+void update_range(int flags, uint32_t first, uint32_t last);
+void sync_chunks();
+```
+
+These methods must be called when the download `is_open()`, is not yet hash-checked, and is not currently hash-checking.
+
+| Method | Description |
+|---|---|
+| `set_chunks_done(uint32_t chunks_done, uint32_t chunks_wanted)` | Sets the count of completed and wanted chunks for a download that has not been opened yet. Use this to restore state from a resume file. |
+| `set_bitfield(bool allSet)` | Initializes the completion bitfield to all-ones (`allSet = true`) or all-zeros. Use all-ones when you are certain the download is complete. |
+| `set_bitfield(const uint8_t* first, const uint8_t* last)` | Copies resume bitfield data from the byte range `[first, last)`. The range must be exactly `ceil(num_chunks / 8)` bytes. |
+| `update_range(int flags, uint32_t first, uint32_t last)` | Modifies the hash-check and completion state for chunk indices in `[first, last)`. Combine `update_range_recheck` and `update_range_clear` with bitwise-OR. |
+| `sync_chunks()` | Forces all dirty chunks to be flushed to disk. Call before saving resume data to ensure consistency. |
+
+### PEX
+
+```cpp
+void set_pex_enabled(bool enabled);
+```
+
+Enables or disables Peer Exchange for this download. PEX cannot be enabled when the torrent is marked private (`DownloadInfo::is_private()` returns `true`).
+
+### Upload and download slot limits
+
+```cpp
+uint32_t uploads_max() const;
+void     set_uploads_max(uint32_t v);
+
+uint32_t uploads_min() const;
+void     set_uploads_min(uint32_t v);
+
+uint32_t downloads_max() const;
+void     set_downloads_max(uint32_t v);
+
+uint32_t downloads_min() const;
+void     set_downloads_min(uint32_t v);
+```
+
+| Method | Description |
+|---|---|
+| `uploads_max() / set_uploads_max(v)` | Get or set the maximum number of simultaneous upload slots for this download. |
+| `uploads_min() / set_uploads_min(v)` | Get or set the minimum number of upload slots the resource manager will try to maintain. |
+| `downloads_max() / set_downloads_max(v)` | Get or set the maximum number of simultaneous download slots (unchoked remote peers). |
+| `downloads_min() / set_downloads_min(v)` | Get or set the minimum number of download slots. |
+
+### Per-download throttles
+
+```cpp
+void set_upload_throttle(Throttle* t);
+void set_download_throttle(Throttle* t);
+```
+
+Assigns a `Throttle` object to this download, overriding the global throttle for upload or download traffic respectively. Pass `nullptr` to revert to the global throttle.
+
+---
+
+## Connection type
+
+```cpp
+enum ConnectionType {
+  CONNECTION_LEECH,
+  CONNECTION_SEED,
+  CONNECTION_INITIAL_SEED,
+  CONNECTION_METADATA,
+};
+
+ConnectionType connection_type() const;
+void           set_connection_type(ConnectionType t);
+```
+
+The connection type controls which peer connection implementation the download uses.
+
+| Value | Description |
+|---|---|
+| `CONNECTION_LEECH` | Standard leeching mode. Downloads pieces from peers while also uploading. |
+| `CONNECTION_SEED` | Seed-only mode. Serves pieces to peers without downloading. |
+| `CONNECTION_INITIAL_SEED` | Initial seeding (super-seeding) mode. Strategically offers rarer pieces to maximize spread. |
+| `CONNECTION_METADATA` | Metadata-only mode, used for magnet link resolution before the full `.torrent` info is available. |
+
+---
+
+## Choke heuristics
+
+```cpp
+enum HeuristicType {
+  // No named values — values are implementation-defined
+};
+
+HeuristicType upload_choke_heuristic() const;
+void          set_upload_choke_heuristic(HeuristicType t);
+
+HeuristicType download_choke_heuristic() const;
+void          set_download_choke_heuristic(HeuristicType t);
+
+void update_priorities();
+```
+
+| Method | Description |
+|---|---|
+| `upload_choke_heuristic() const` | Returns the algorithm used to decide which peers to unchoke for uploading. |
+| `set_upload_choke_heuristic(HeuristicType t)` | Sets the upload unchoke algorithm. |
+| `download_choke_heuristic() const` | Returns the algorithm used to decide which peers to unchoke for downloading. |
+| `set_download_choke_heuristic(HeuristicType t)` | Sets the download unchoke algorithm. |
+| `update_priorities()` | Re-evaluates all peer bitfields to determine interest after you have changed file or piece priorities. This is moderately expensive; avoid calling it in tight loops. |
+
+<Note>
+  `HeuristicType` is declared as an empty enum in the current public API. Available values are implementation-defined; consult the source or configuration layer of your application for valid options.
+</Note>
+
+---
+
+## Tracker control
+
+```cpp
+void send_completed();
+void manual_request(bool force);
+void manual_cancel();
+```
+
+| Method | Description |
+|---|---|
+| `send_completed()` | Sends a `completed` event to all trackers, signaling that the download has finished. The library calls this automatically when the last piece is verified; you only need to call it manually in edge cases. |
+| `manual_request(bool force)` | Triggers an immediate tracker announce. When `force` is `true`, the request bypasses the minimum re-announce interval. |
+| `manual_cancel()` | Cancels any pending manual tracker request previously scheduled with `manual_request()`. |

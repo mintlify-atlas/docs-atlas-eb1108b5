@@ -1,0 +1,210 @@
+---
+title: "Throttle — Bandwidth Rate Limiting and Measurement"
+description: "Create and configure upload and download throttles, read live rate measurements, and apply global or per-address bandwidth caps in libTorrent."
+---
+
+`Throttle` controls how many bytes per second libTorrent sends or receives across a set of connections. You create standalone throttles with `Throttle::create_throttle()` and derive slave throttles from them. The global upload and download throttles are available through `torrent::up_throttle_global()` and `torrent::down_throttle_global()`. `Rate` tracks the actual measured throughput for a throttle or a single peer.
+
+```cpp
+#include <torrent/throttle.h>
+#include <torrent/rate.h>
+#include <torrent/torrent.h>
+#include <torrent/connection_manager.h>  // ThrottlePair
+```
+
+---
+
+## ThrottlePair
+
+`ThrottlePair` pairs an upload throttle with a download throttle. It is defined in `<torrent/connection_manager.h>` and used by `ConnectionManager::address_throttle()` to assign per-address throttles.
+
+```cpp
+namespace torrent {
+
+using ThrottlePair = std::pair<Throttle*, Throttle*>;
+//  .first  = upload throttle
+//  .second = download throttle
+
+}
+```
+
+Pass `ThrottlePair{nullptr, nullptr}` to indicate that the global throttles should be used instead of a custom pair.
+
+---
+
+## Throttle
+
+`Throttle` is not directly constructible. Use the static factory methods to create and destroy instances.
+
+```cpp
+namespace torrent {
+
+class Throttle {
+public:
+  // Factory
+  static Throttle* create_throttle();
+  static void      destroy_throttle(Throttle* throttle);
+
+  // Slave throttles
+  Throttle* create_slave();
+
+  // Rate control
+  bool     is_throttled()      const;
+  uint64_t max_rate()          const;
+  void     set_max_rate(uint64_t v);
+
+  const Rate* rate()           const;
+
+  // Internal list
+  ThrottleList* throttle_list();
+};
+
+}
+```
+
+### Factory methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `create_throttle()` | `Throttle*` | Allocates and initializes a new standalone throttle. You own the returned pointer; call `destroy_throttle` when done. |
+| `destroy_throttle(Throttle* throttle)` | `void` | Frees a throttle created by `create_throttle`. Do not destroy a throttle while it still has slaves or active connections. |
+
+<Warning>
+  Destroying a throttle while connections are still using it causes undefined behavior. Remove all connections from the throttle before calling `destroy_throttle`.
+</Warning>
+
+### Slave throttles
+
+```cpp
+Throttle* slave = parent->create_slave();
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `create_slave()` | `Throttle*` | Creates a dependent (slave) throttle. A slave draws its allocation from the parent. This lets you subdivide a top-level bandwidth cap across multiple groups of connections. |
+
+<Note>
+  A slave throttle does not have an independent `max_rate`. Its effective limit is bounded by the parent's `max_rate`. Setting `max_rate` on a slave further restricts the slave's share, but it can never exceed the parent's cap.
+</Note>
+
+### Rate control
+
+| Method | Returns | Description |
+|---|---|---|
+| `is_throttled() const` | `bool` | `true` when `max_rate() > 0`. A throttle with `max_rate == 0` imposes no limit. |
+| `max_rate() const` | `uint64_t` | The configured byte-per-second cap. `0` means unlimited. |
+| `set_max_rate(uint64_t v)` | `void` | Sets the cap in bytes per second. Pass `0` to remove the limit. |
+| `rate() const` | `const Rate*` | Returns the `Rate` object tracking this throttle's actual current throughput. |
+
+**Example: limit global upload to 1 MB/s**
+
+```cpp
+torrent::up_throttle_global()->set_max_rate(1 * 1024 * 1024);
+```
+
+**Example: create an independent download throttle**
+
+```cpp
+torrent::Throttle* cap = torrent::Throttle::create_throttle();
+cap->set_max_rate(512 * 1024);  // 512 KB/s
+
+// Assign it to all connections from a specific address
+torrent::connection_manager()->address_throttle() =
+  [=](const sockaddr* sa) -> torrent::ThrottlePair {
+    if (is_lan_address(sa))
+      return {nullptr, cap};   // only cap download; upload is unlimited
+    return {nullptr, nullptr}; // use global throttles for everything else
+  };
+```
+
+### Internal access
+
+| Method | Returns | Description |
+|---|---|---|
+| `throttle_list()` | `ThrottleList*` | Returns the internal `ThrottleList` that manages slot distribution across connections attached to this throttle. Used internally; do not modify unless you are extending the library. |
+
+---
+
+## Global throttles and rates
+
+libTorrent exposes four global accessors defined in `<torrent/torrent.h>`:
+
+```cpp
+namespace torrent {
+
+Throttle*    down_throttle_global();
+Throttle*    up_throttle_global();
+
+const Rate*  down_rate();
+const Rate*  up_rate();
+
+}
+```
+
+| Function | Returns | Description |
+|---|---|---|
+| `down_throttle_global()` | `Throttle*` | The global download throttle. All connections use this unless overridden by `address_throttle()`. |
+| `up_throttle_global()` | `Throttle*` | The global upload throttle. All connections use this unless overridden by `address_throttle()`. |
+| `down_rate()` | `const Rate*` | Aggregate measured download rate across all active connections (read-only). |
+| `up_rate()` | `const Rate*` | Aggregate measured upload rate across all active connections (read-only). |
+
+<Tip>
+  `down_rate()` and `up_rate()` measure actual throughput, not configured limits. Use them for display or adaptive rate control. Use `down_throttle_global()->rate()` to read the rate associated with the global throttle specifically.
+</Tip>
+
+---
+
+## Rate class
+
+`Rate` measures bytes per second over a sliding window. You never construct `Rate` directly; you read it through `Throttle::rate()`, `Peer::down_rate()`, `Peer::up_rate()`, or the global `torrent::down_rate()` and `torrent::up_rate()` accessors.
+
+```cpp
+namespace torrent {
+
+class Rate {
+public:
+  using timer_type = int32_t;
+  using rate_type  = uint64_t;
+  using total_type = uint64_t;
+
+  rate_type  rate()               const;
+  total_type total()              const;
+  void       set_total(total_type bytes);
+  timer_type span()               const;
+  void       set_span(timer_type s);
+  void       insert(rate_type bytes);
+  void       reset_rate();
+};
+
+}
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `rate() const` | `rate_type` (`uint64_t`) | Current bytes per second, calculated over the most recent `span()` seconds. |
+| `total() const` | `total_type` (`uint64_t`) | Cumulative total bytes transferred since the `Rate` was created or last reset. |
+| `set_total(total_type bytes)` | `void` | Overrides the cumulative total. Useful when resuming a download with a pre-existing byte count. |
+| `span() const` | `timer_type` (`int32_t`) | The measurement window in seconds used to calculate `rate()`. |
+| `set_span(timer_type s)` | `void` | Changes the measurement window. A smaller window reacts faster; a larger window smooths spikes. |
+| `insert(rate_type bytes)` | `void` | Records a new transfer event. libTorrent calls this internally; you do not normally call it directly. |
+| `reset_rate()` | `void` | Clears the current rate measurement without changing `total()`. |
+
+<AccordionGroup>
+  <Accordion title="Reading rate values">
+    `rate()` iterates a deque of time-stamped samples internally on each call. The result is updated automatically as time passes — you do not need to call any update function.
+
+    ```cpp
+    const torrent::Rate* r = torrent::down_rate();
+    uint64_t bps   = r->rate();   // bytes per second
+    uint64_t total = r->total();  // total bytes since start
+    ```
+  </Accordion>
+  <Accordion title="Comparison operators">
+    `Rate` supports `<`, `>`, `==`, and `!=` comparisons against both other `Rate` objects and raw `rate_type` values. All comparisons operate on the current `rate()` value.
+
+    ```cpp
+    if (*torrent::down_rate() > uint64_t(1024 * 1024))
+      std::cout << "Downloading faster than 1 MB/s\n";
+    ```
+  </Accordion>
+</AccordionGroup>

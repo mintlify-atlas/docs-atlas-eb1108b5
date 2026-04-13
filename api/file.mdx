@@ -1,0 +1,224 @@
+---
+title: "File class — per-file metadata, priority, and access"
+description: "Reference for the File class in libTorrent: state flags, chunk ranges, download priority, path components, file descriptor handling, and match depth."
+---
+
+The `File` class represents a single file entry within a torrent. You obtain `File` pointers by iterating over a `FileList` — you never construct a `File` directly. Each instance tracks the file's byte offset within the torrent, its chunk range, download priority, open/creation state, and the path components that make up its on-disk location.
+
+<Note>
+  `File` is non-copyable and non-assignable. `FileList` is the sole owner and manages object lifetime.
+</Note>
+
+## State flags
+
+These `static constexpr int` constants represent individual bits in the file's internal flags field. You pass them to `has_flags()`, `set_flags()`, and `unset_flags()`.
+
+```cpp
+static constexpr int flag_active             = (1 << 0); // file is currently open
+static constexpr int flag_create_queued      = (1 << 1); // creation scheduled
+static constexpr int flag_resize_queued      = (1 << 2); // resize scheduled
+static constexpr int flag_fallocate          = (1 << 3); // use fallocate on creation
+static constexpr int flag_previously_created = (1 << 4); // file existed before this session
+static constexpr int flag_prioritize_first   = (1 << 5); // boost first chunk of this file
+static constexpr int flag_prioritize_last    = (1 << 6); // boost last chunk of this file
+static constexpr int flag_attr_padding       = (1 << 7); // file is a padding file (BEP 47)
+```
+
+<Warning>
+  `set_flags()` and `unset_flags()` only honour the subset of flags that are safe for external callers to modify: `flag_create_queued`, `flag_resize_queued`, `flag_fallocate`, `flag_prioritize_first`, `flag_prioritize_last`, and `flag_attr_padding`. Attempts to set `flag_active` or `flag_previously_created` through the public interface are silently ignored.
+</Warning>
+
+## Type aliases
+
+```cpp
+using range_type = std::pair<uint32_t, uint32_t>;
+```
+
+`range_type` holds the half-open chunk index range `[first, second)` that this file occupies within the torrent's chunk space.
+
+## State queries
+
+```cpp
+bool is_created() const;
+bool is_open() const;          // true when m_fd != -1
+bool is_correct_size() const;
+bool is_valid_position(uint64_t p) const;
+
+bool is_create_queued() const;
+bool is_resize_queued() const;
+bool is_previously_created() const;
+bool is_padding() const;
+
+bool has_flags(int flags) const;
+```
+
+| Method | Returns `true` when… |
+|---|---|
+| `is_created()` | The on-disk file exists at the expected path |
+| `is_open()` | A valid file descriptor is held (`m_fd != -1`) |
+| `is_correct_size()` | The file's on-disk size matches `size_bytes()` |
+| `is_valid_position(p)` | `p >= offset()` and `p < offset() + size_bytes()` |
+| `is_create_queued()` | `flag_create_queued` is set |
+| `is_resize_queued()` | `flag_resize_queued` is set |
+| `is_previously_created()` | `flag_previously_created` is set |
+| `is_padding()` | `flag_attr_padding` is set (BEP 47 padding file) |
+| `has_flags(flags)` | Any bit in `flags` is set in the internal flags field |
+
+## Flag management
+
+```cpp
+void set_flags(int flags);
+void unset_flags(int flags);
+```
+
+These methods modify only the externally settable subset of flags. Pass a bitwise-OR combination of the constants above.
+
+```cpp
+// Schedule creation and request fallocate:
+file->set_flags(torrent::File::flag_create_queued | torrent::File::flag_fallocate);
+
+// Clear the prioritize-first hint:
+file->unset_flags(torrent::File::flag_prioritize_first);
+```
+
+## Size and position
+
+```cpp
+uint64_t offset() const;           // byte offset of this file within the torrent
+uint64_t size_bytes() const;       // file size in bytes
+uint32_t size_chunks() const;      // range.second - range.first (number of chunks touched)
+uint32_t completed_chunks() const; // chunks fully verified and written
+void     set_completed_chunks(uint32_t v);
+```
+
+`offset()` is the cumulative byte offset of the file's first byte within the flat torrent data stream. Use it alongside `size_bytes()` to compute byte ranges within the torrent.
+
+`size_chunks()` counts every chunk that overlaps this file, including chunks shared with adjacent files. A chunk is shared when a file boundary falls mid-chunk.
+
+<Tip>
+  To calculate download progress for a single file, divide `completed_chunks()` by `size_chunks()`. Note that shared boundary chunks count toward both files.
+</Tip>
+
+## Chunk range
+
+```cpp
+const range_type& range() const;       // pair<first_chunk, last_chunk+1>
+uint32_t          range_first() const; // index of first chunk
+uint32_t          range_second() const;// index one past the last chunk
+```
+
+The range is half-open: `[range_first(), range_second())`. You can iterate chunk indices with:
+
+```cpp
+for (uint32_t i = file->range_first(); i < file->range_second(); ++i) {
+    // process chunk i
+}
+```
+
+## Priority
+
+libTorrent uses the `priority_enum` type defined in `<torrent/common.h>`:
+
+```cpp
+enum priority_enum {
+    PRIORITY_OFF    = 0, // do not download this file
+    PRIORITY_NORMAL = 1, // download at normal priority (default)
+    PRIORITY_HIGH   = 2  // download before PRIORITY_NORMAL files
+};
+```
+
+```cpp
+priority_enum priority() const;
+void          set_priority(priority_enum t);
+```
+
+Setting a file to `PRIORITY_OFF` tells the chunk selector to skip all chunks exclusive to this file. Chunks shared with a higher-priority file are still downloaded.
+
+```cpp
+// Skip a padding file:
+file->set_priority(torrent::PRIORITY_OFF);
+
+// Boost the first file in the torrent:
+file->set_priority(torrent::PRIORITY_HIGH);
+```
+
+## Path
+
+```cpp
+const Path* path() const;         // read-only path
+Path*       mutable_path();       // writable path (use with care)
+const std::string& frozen_path() const; // immutable path string set by FileList
+```
+
+`path()` returns a pointer to the file's `Path` object, which stores the individual directory and filename components. `frozen_path()` returns the joined, slash-separated path string that `FileList` computed when it opened the torrent — use this for stable on-disk references.
+
+See the [Path class](/api/file-list#path-class) reference for methods available on `Path*`.
+
+## File descriptor and permissions
+
+```cpp
+int  file_descriptor() const;          // underlying OS file descriptor (-1 if closed)
+bool has_permissions(int prot) const;  // true if current protection covers prot
+int  protection() const;               // current mmap protection flags (PROT_*)
+bool prepare(bool hashing, int prot, int flags); // open/configure the file
+uint64_t last_touched() const;         // monotonic timestamp of last write
+```
+
+`prepare()` is called internally by `FileList` to open a file and set its protection level before I/O. You typically do not call this yourself.
+
+`has_permissions(prot)` checks whether the currently mapped protection flags are a superset of `prot`. The `prot` values are standard POSIX mmap protection constants (`PROT_READ`, `PROT_WRITE`).
+
+```cpp
+// Check whether the file is currently writable:
+if (file->has_permissions(PROT_WRITE)) {
+    // safe to write
+}
+```
+
+## Match depth (shared directory detection)
+
+```cpp
+uint32_t match_depth_prev() const; // shared path depth with the previous file
+uint32_t match_depth_next() const; // shared path depth with the next file
+```
+
+These values indicate how many leading path components this file shares with its immediate neighbours in the `FileList`. libTorrent uses them to avoid redundant `mkdir` calls. A value of `0` means the file is in a completely different directory tree from its neighbour.
+
+<AccordionGroup>
+  <Accordion title="Complete usage example">
+
+```cpp
+#include <torrent/data/file.h>
+#include <torrent/data/file_list.h>
+
+void inspect_file(const torrent::File* file) {
+    // State
+    std::cout << "open:    " << file->is_open() << "\n";
+    std::cout << "created: " << file->is_created() << "\n";
+    std::cout << "padding: " << file->is_padding() << "\n";
+
+    // Size
+    std::cout << "offset:     " << file->offset() << " bytes\n";
+    std::cout << "size:       " << file->size_bytes() << " bytes\n";
+    std::cout << "chunks:     " << file->size_chunks() << "\n";
+    std::cout << "completed:  " << file->completed_chunks() << "\n";
+
+    // Range
+    std::cout << "chunk range: ["
+              << file->range_first() << ", "
+              << file->range_second() << ")\n";
+
+    // Priority
+    using P = torrent::priority_enum;
+    const char* prio_str =
+        file->priority() == P::PRIORITY_HIGH   ? "high"   :
+        file->priority() == P::PRIORITY_NORMAL ? "normal" : "off";
+    std::cout << "priority: " << prio_str << "\n";
+
+    // Path
+    std::cout << "path: " << file->frozen_path() << "\n";
+}
+```
+
+  </Accordion>
+</AccordionGroup>

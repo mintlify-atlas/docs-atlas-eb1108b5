@@ -1,0 +1,275 @@
+---
+title: "DownloadInfo — Download Metadata and State Reference"
+description: "Reference for the DownloadInfo class: names, info hashes, transfer rates, flags, PEX state, signals, and baseline accounting for a single download."
+---
+
+`DownloadInfo` stores the metadata and runtime state for a single download: its human-readable name, SHA-1 info hash, transfer rates, status flags, PEX configuration, upload/download baselines, and tracker event signals. You access it as a read-only pointer through `Download::info()`. The class is declared in `<torrent/download_info.h>`.
+
+<Warning>
+  `DownloadInfo` is exposed through the public API as a `const DownloadInfo*`. Most of its setters and mutable accessors are intended for internal library use. Do not call the non-const setters from application code unless you understand the library internals; doing so can corrupt download state.
+</Warning>
+
+---
+
+## Accessing DownloadInfo
+
+```cpp
+const DownloadInfo* info = download.info();
+```
+
+You retrieve `DownloadInfo` from a `Download` handle. The pointer is valid for the lifetime of the download (between `download_add()` and `download_remove()`). You must not dereference it after calling `torrent::download_remove()`.
+
+---
+
+## State enum
+
+```cpp
+enum State {
+  NONE,
+  COMPLETED,
+  STARTED,
+  STOPPED
+};
+```
+
+| Value | Description |
+|---|---|
+| `NONE` | Download has not been started. |
+| `COMPLETED` | All pieces have been downloaded and verified. |
+| `STARTED` | Download is actively running. |
+| `STOPPED` | Download has been stopped but not closed. |
+
+---
+
+## Flag constants
+
+```cpp
+static constexpr int flag_open                = (1 << 0);  // 0x01
+static constexpr int flag_active              = (1 << 1);  // 0x02
+static constexpr int flag_accepting_new_peers = (1 << 3);  // 0x08
+static constexpr int flag_accepting_seeders   = (1 << 4);  // 0x10
+static constexpr int flag_private             = (1 << 5);  // 0x20
+static constexpr int flag_meta_download       = (1 << 6);  // 0x40
+static constexpr int flag_pex_enabled         = (1 << 7);  // 0x80
+static constexpr int flag_pex_active          = (1 << 8);  // 0x100
+
+static constexpr int public_flags = flag_accepting_seeders;
+
+static constexpr uint32_t unlimited = ~uint32_t();
+```
+
+| Constant | Value | Description |
+|---|---|---|
+| `flag_open` | `1 << 0` | Files are open and memory-mapped. |
+| `flag_active` | `1 << 1` | Download is actively transferring data. |
+| `flag_accepting_new_peers` | `1 << 3` | The download will accept incoming peer connections. |
+| `flag_accepting_seeders` | `1 << 4` | The download accepts connections from seeders (leeching mode only). This is the only publicly mutable flag. |
+| `flag_private` | `1 << 5` | The torrent is marked private; PEX and DHT are disabled. |
+| `flag_meta_download` | `1 << 6` | This is a metadata-only download (magnet link mode). |
+| `flag_pex_enabled` | `1 << 7` | PEX is enabled for this download (not set when private). |
+| `flag_pex_active` | `1 << 8` | PEX is currently active and exchanging peer addresses. |
+| `public_flags` | `flag_accepting_seeders` | Bitmask of flags that application code is permitted to modify via `public_set_flags` / `public_unset_flags`. |
+| `unlimited` | `~uint32_t()` | Sentinel value meaning "no limit". |
+
+---
+
+## Identity
+
+```cpp
+const std::string& name() const;
+
+const HashString& hash() const;
+const HashString& info_hash() const;
+const HashString& hash_obfuscated() const;
+const HashString& info_hash_obfuscated() const;
+const HashString& local_id() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `name() const` | `const std::string&` | The human-readable name of the torrent, taken from the `name` key in the info dictionary. |
+| `hash() const` | `const HashString&` | The 20-byte SHA-1 info hash. `info_hash()` is an alias for the same value. |
+| `info_hash() const` | `const HashString&` | Alias for `hash()`. Prefer this name in new code. |
+| `hash_obfuscated() const` | `const HashString&` | The obfuscated info hash used in MSE (Message Stream Encryption) handshakes. `info_hash_obfuscated()` is an alias. |
+| `info_hash_obfuscated() const` | `const HashString&` | Alias for `hash_obfuscated()`. |
+| `local_id() const` | `const HashString&` | The local peer ID associated with this download. |
+
+`HashString` is a fixed-width 20-byte buffer. Use `hash().str()` to get a `std::string`, or iterate `hash().begin()` / `hash().end()` for raw bytes.
+
+---
+
+## Status flags (read)
+
+```cpp
+bool is_open() const;
+bool is_active() const;
+bool is_accepting_new_peers() const;
+bool is_accepting_seeders() const;
+bool is_private() const;
+bool is_meta_download() const;
+bool is_pex_enabled() const;
+bool is_pex_active() const;
+
+int flags() const;
+```
+
+Each predicate tests the corresponding `flag_*` bit in the internal flags field.
+
+| Method | Returns | Description |
+|---|---|---|
+| `is_open() const` | `bool` | `true` when files are open. |
+| `is_active() const` | `bool` | `true` when the download is actively running. |
+| `is_accepting_new_peers() const` | `bool` | `true` when new incoming peers are accepted. |
+| `is_accepting_seeders() const` | `bool` | `true` when seeder connections are accepted (leeching mode). |
+| `is_private() const` | `bool` | `true` for private torrents. |
+| `is_meta_download() const` | `bool` | `true` for magnet link / metadata-only downloads. |
+| `is_pex_enabled() const` | `bool` | `true` when PEX is permitted. |
+| `is_pex_active() const` | `bool` | `true` when PEX is currently running. |
+| `flags() const` | `int` | Returns the raw flags bitmask. |
+
+---
+
+## Public flag mutation
+
+Application code may only modify the `flag_accepting_seeders` flag through the public API:
+
+```cpp
+void public_set_flags(int flags) const;
+void public_unset_flags(int flags) const;
+void public_change_flags(int flags, bool state) const;
+```
+
+The `flags` argument is silently masked to `public_flags` before being applied, so passing other flag bits has no effect.
+
+---
+
+## Transfer rates
+
+```cpp
+const Rate* up_rate() const;
+const Rate* down_rate() const;
+const Rate* skip_rate() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `up_rate() const` | `const Rate*` | Upload rate for this download. Access `->rate()` for bytes/second and `->total()` for total bytes uploaded. |
+| `down_rate() const` | `const Rate*` | Download rate for this download. |
+| `skip_rate() const` | `const Rate*` | Rate at which data was skipped (received but not needed due to redundancy). |
+
+`Rate` uses a sliding 60-second window by default. See the `Rate` class for the full interface.
+
+---
+
+## Upload baseline accounting
+
+```cpp
+uint64_t uploaded_baseline() const;
+uint64_t uploaded_adjusted() const;
+void     set_uploaded_baseline(uint64_t b);
+
+uint64_t completed_baseline() const;
+uint64_t completed_adjusted() const;
+void     set_completed_baseline(uint64_t b);
+```
+
+Baseline values allow a client to track how much data was uploaded or downloaded in the current session, independently of the running total.
+
+| Method | Returns | Description |
+|---|---|---|
+| `uploaded_baseline() const` | `uint64_t` | The total bytes uploaded at the point the session started (or the baseline was last set). |
+| `uploaded_adjusted() const` | `uint64_t` | Bytes uploaded since the baseline: `max(up_rate()->total() - uploaded_baseline(), 0)`. |
+| `set_uploaded_baseline(uint64_t b)` | `void` | Updates the upload baseline. Call at session start to track per-session upload correctly. |
+| `completed_baseline() const` | `uint64_t` | The completed-bytes count at the point the baseline was last set. |
+| `completed_adjusted() const` | `uint64_t` | Bytes completed since the baseline. |
+| `set_completed_baseline(uint64_t b)` | `void` | Updates the completed baseline. |
+
+---
+
+## Metadata size
+
+```cpp
+size_t metadata_size() const;
+```
+
+Returns the size in bytes of the `.torrent` info dictionary. For metadata downloads (magnet links), this is the target size of the `ut_metadata` extension data being fetched. Returns `0` for normal torrents.
+
+---
+
+## PEX configuration
+
+```cpp
+uint32_t size_pex() const;
+uint32_t max_size_pex() const;
+
+static uint32_t max_size_pex_list();
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `size_pex() const` | `uint32_t` | Current number of peers in the PEX address list. |
+| `max_size_pex() const` | `uint32_t` | Maximum number of PEX addresses to store (default `8`). |
+| `max_size_pex_list()` (static) | `uint32_t` | Hard cap of `200` on the total number of PEX addresses that can be sent in a single PEX message. |
+
+---
+
+## Dates
+
+```cpp
+uint32_t creation_date() const;
+uint32_t load_date() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `creation_date() const` | `uint32_t` | Unix timestamp from the `creation date` key in the torrent file. Returns `0` if not present. |
+| `load_date() const` | `uint32_t` | Unix timestamp of when this download was loaded into the library. Returns `0` if not set. |
+
+---
+
+## Unchoke counters
+
+```cpp
+uint32_t upload_unchoked() const;
+uint32_t download_unchoked() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `upload_unchoked() const` | `uint32_t` | Number of peers currently unchoked for uploading by this download. |
+| `download_unchoked() const` | `uint32_t` | Number of peers currently unchoked for downloading by this download. |
+
+---
+
+## Signals
+
+`DownloadInfo` exposes two signal lists you can subscribe to in order to receive tracker event notifications:
+
+```cpp
+using signal_void_type   = std::list<std::function<void()>>;
+using signal_string_type = std::list<std::function<void(const std::string&)>>;
+
+signal_void_type&   signal_tracker_success() const;
+signal_string_type& signal_tracker_failed() const;
+```
+
+| Method | Returns | Description |
+|---|---|---|
+| `signal_tracker_success() const` | `signal_void_type&` | List of callbacks invoked when a tracker announce or scrape succeeds. Append a `std::function<void()>` to subscribe. |
+| `signal_tracker_failed() const` | `signal_string_type&` | List of callbacks invoked when a tracker request fails. The callback receives the failure reason as a `const std::string&`. |
+
+<Tip>
+  Subscribe to these signals to update your UI or log tracker connectivity issues:
+
+  ```cpp
+  const DownloadInfo* info = download.info();
+
+  info->signal_tracker_success().push_back([]() {
+    // tracker announce succeeded
+  });
+
+  info->signal_tracker_failed().push_back([](const std::string& reason) {
+    // log reason
+  });
+  ```
+</Tip>

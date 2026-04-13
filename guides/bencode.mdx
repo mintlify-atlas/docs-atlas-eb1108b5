@@ -1,0 +1,300 @@
+---
+title: "Bencode Serialization with the Object API"
+description: "Parse, build, and serialize bencoded data using libTorrent's Object class, covering all types, map and list operations, flags, and merge semantics."
+---
+
+Bencode is the serialization format used in all `.torrent` files and BitTorrent protocol messages. It encodes integers, byte strings, lists, and dictionaries in a compact, human-readable ASCII format. libTorrent's `Object` class is a tagged-union value type that represents any bencode value and provides a rich API for construction, inspection, traversal, and serialization.
+
+## Object types
+
+The `Object::type_type` enum identifies what value an `Object` holds:
+
+```cpp
+enum type_type {
+  TYPE_NONE,         // empty / uninitialized
+  TYPE_RAW_BENCODE,  // raw bencode bytes (not yet decoded)
+  TYPE_RAW_STRING,   // raw string bytes (not yet decoded)
+  TYPE_RAW_LIST,     // raw list bytes (not yet decoded)
+  TYPE_RAW_MAP,      // raw map bytes (not yet decoded)
+  TYPE_VALUE,        // int64_t integer
+  TYPE_STRING,       // std::string
+  TYPE_LIST,         // std::vector<Object>
+  TYPE_MAP,          // std::map<std::string, Object>
+  TYPE_DICT_KEY      // key+value pair used internally
+};
+```
+
+Raw types hold bencode-encoded bytes without decoding them. Convert to normal types when you need to access their contents (see [Converting raw types](#converting-raw-types)).
+
+## Creating objects
+
+Use the static factory methods to create typed `Object` instances:
+
+```cpp
+#include <torrent/object.h>
+
+torrent::Object v   = torrent::Object::create_value();   // int64_t, initialized to 0
+torrent::Object s   = torrent::Object::create_string();  // empty std::string
+torrent::Object lst = torrent::Object::create_list();    // empty vector
+torrent::Object m   = torrent::Object::create_map();     // empty map
+
+// Construct from literals
+torrent::Object vi(int64_t(42));
+torrent::Object vs("hello");
+torrent::Object vs2(std::string("hello"));
+```
+
+Raw types:
+
+```cpp
+torrent::Object rb = torrent::Object::create_raw_bencode();
+torrent::Object rs = torrent::Object::create_raw_string();
+torrent::Object rl = torrent::Object::create_raw_list();
+torrent::Object rm = torrent::Object::create_raw_map();
+```
+
+## Type checking
+
+```cpp
+bool empty    = obj.is_empty();       // TYPE_NONE
+bool nonempty = obj.is_not_empty();
+bool is_int   = obj.is_value();
+bool is_str   = obj.is_string();
+bool is_lst   = obj.is_list();
+bool is_map   = obj.is_map();
+bool is_rb    = obj.is_raw_bencode();
+bool is_rs    = obj.is_raw_string();
+bool is_rl    = obj.is_raw_list();
+bool is_rm    = obj.is_raw_map();
+
+torrent::Object::type_type t = obj.type();
+const char* type_name = torrent::Object::type_to_c_str(t);
+```
+
+## Accessing values
+
+The `as_*` accessors throw `torrent::bencode_error` on a type mismatch:
+
+```cpp
+int64_t            i   = obj.as_value();
+std::string&       str = obj.as_string();
+torrent::Object::list_type& lst = obj.as_list();
+torrent::Object::map_type&  mp  = obj.as_map();
+
+torrent::raw_bencode& rb = obj.as_raw_bencode();
+torrent::raw_string&  rs = obj.as_raw_string();
+torrent::raw_list&    rl = obj.as_raw_list();
+torrent::raw_map&     rm = obj.as_raw_map();
+```
+
+Always guard with a type check when the type is uncertain:
+
+```cpp
+if (obj.is_value()) {
+  int64_t n = obj.as_value();
+}
+```
+
+## Map operations
+
+Maps use `std::string` keys and `Object` values, ordered lexicographically (bencode dictionaries must be sorted):
+
+```cpp
+torrent::Object m = torrent::Object::create_map();
+
+// Insert or overwrite
+m.insert_key("name",  torrent::Object("My Torrent"));
+m.insert_key("piece length", torrent::Object(int64_t(262144)));
+
+// Check existence
+bool has = m.has_key("name");
+bool has_str = m.has_key_string("name");   // exists AND is TYPE_STRING
+bool has_val = m.has_key_value("piece length");
+
+// Access (throws if key missing or wrong type)
+torrent::Object&       entry = m.get_key("name");
+const std::string& name_str  = m.get_key_string("name");
+int64_t piece_len            = m.get_key_value("piece length");
+
+// Access list/map values
+torrent::Object::list_type& files = m.get_key_list("files");
+torrent::Object::map_type&  info  = m.get_key_map("info");
+
+// Erase
+m.erase_key("name");
+```
+
+### Preserve-on-insert variants
+
+These insert only if the key does not already exist:
+
+```cpp
+auto [itr, inserted] = m.insert_preserve_any("key", some_object);
+// inserted == true if the key was new
+```
+
+## List operations
+
+```cpp
+torrent::Object lst = torrent::Object::create_list();
+
+torrent::Object& front = lst.insert_front(torrent::Object("first"));
+torrent::Object& back  = lst.insert_back(torrent::Object("last"));
+
+// Iterate
+for (const torrent::Object& item : lst.as_list()) {
+  // process item
+}
+```
+
+Build a list from an iterator range:
+
+```cpp
+std::vector<torrent::Object> vec = { torrent::Object(int64_t(1)), torrent::Object(int64_t(2)) };
+torrent::Object range_list = torrent::Object::create_list_range(vec.begin(), vec.end());
+```
+
+## Object flags
+
+Flags occupy the high bits of the internal flags word and are separate from the type field:
+
+```cpp
+// Semantic flags (use to tag objects for session/config management)
+static constexpr uint32_t flag_static_data  = 0x010000; // value does not change across sessions
+static constexpr uint32_t flag_session_data = 0x020000; // value changes between sessions
+
+// Function markers (used by rtorrent scripting)
+static constexpr uint32_t flag_function     = 0x040000;
+static constexpr uint32_t flag_function_q1  = 0x080000;
+static constexpr uint32_t flag_function_q2  = 0x100000;
+```
+
+Set and clear public flags:
+
+```cpp
+obj.set_flags(torrent::Object::flag_static_data);
+obj.unset_flags(torrent::Object::flag_static_data);
+uint32_t f = obj.flags();
+```
+
+Internal flags (below `0xffff`) are reserved for libTorrent and cannot be set through the public API.
+
+## Merge operations
+
+Merge two maps together, with the source winning over the destination:
+
+```cpp
+// Move-merge: source entries moved into destination; source left empty
+dest.merge_move(source);
+dest.merge_move(source, /* maxDepth = */ 2);
+
+// Copy-merge: source entries copied; flag_static_data entries skipped by default
+dest.merge_copy(source);
+dest.merge_copy(source, torrent::Object::flag_session_data, /* maxDepth = */ ~0u);
+```
+
+The `skip_mask` parameter in `merge_copy` causes entries whose flags match the mask to be skipped. This is useful for selectively copying only session data or only static data.
+
+## Converting raw types
+
+Raw types are lazy-decoded views into bencode bytes. Convert them to normal types when you need to traverse their contents:
+
+```cpp
+#include <torrent/object.h>  // object_create_normal is declared here
+
+torrent::Object normal = torrent::object_create_normal(obj); // dispatches on type
+
+// Overloads for each raw type:
+torrent::Object from_rb = torrent::object_create_normal(obj.as_raw_bencode());
+torrent::Object from_rs = torrent::object_create_normal(obj.as_raw_string());
+torrent::Object from_rl = torrent::object_create_normal(obj.as_raw_list());
+torrent::Object from_rm = torrent::object_create_normal(obj.as_raw_map());
+```
+
+<Note>
+Converting raw types does not preserve the original flags. If you need the flags, copy them manually after conversion.
+</Note>
+
+## Reading a torrent file
+
+```cpp
+#include <fstream>
+#include <torrent/object.h>
+#include <torrent/object_stream.h>
+
+torrent::Object* read_torrent_file(const std::string& path) {
+  std::ifstream file(path, std::ios::binary);
+  file.imbue(std::locale::classic());  // must be POSIX/C locale
+
+  auto* obj = new torrent::Object();
+  torrent::object_read_bencode(&file, obj);
+  return obj;
+}
+```
+
+Or use the stream extraction operator:
+
+```cpp
+torrent::Object obj;
+std::ifstream f("example.torrent", std::ios::binary);
+f.imbue(std::locale::classic());
+f >> obj;
+```
+
+Access the info dict:
+
+```cpp
+const torrent::Object::map_type& root = obj.as_map();
+const torrent::Object& info = obj.get_key("info");
+const std::string& name = info.get_key_string("name");
+int64_t piece_len = info.get_key_value("piece length");
+```
+
+## Writing bencode
+
+Write an `Object` to a stream:
+
+```cpp
+#include <torrent/object_stream.h>
+
+std::ofstream out("output.torrent", std::ios::binary);
+out.imbue(std::locale::classic());
+torrent::object_write_bencode(&out, &obj);
+
+// Or using the stream insertion operator:
+out << obj;
+```
+
+Write to a char buffer:
+
+```cpp
+char buf[4096];
+torrent::object_buffer_t result = torrent::object_write_bencode(buf, buf + sizeof(buf), &obj);
+// result.first points one past the last byte written
+```
+
+Skip entries that match a flag mask during write (e.g., skip session data when saving static config):
+
+```cpp
+torrent::object_write_bencode(&out, &obj, torrent::Object::flag_session_data);
+```
+
+## Reading from a raw bencode C string
+
+```cpp
+const char* data = "d4:name5:hello3:agei30ee";
+torrent::Object obj;
+torrent::object_read_bencode_c(data, data + strlen(data), &obj);
+```
+
+## Error handling
+
+All `as_*` accessors and `get_key*` methods throw `torrent::bencode_error` on type mismatches or missing keys. Always check types before accessing values in untrusted data:
+
+```cpp
+try {
+  int64_t val = obj.as_value();
+} catch (const torrent::bencode_error& e) {
+  std::cerr << "bencode error: " << e.what() << "\n";
+}
+```

@@ -1,0 +1,259 @@
+---
+title: "Error Handling and Exception Types"
+description: "Understand libTorrent's exception hierarchy rooted at base_error, covering network, local, and internal errors, with catch patterns for each type."
+---
+
+libTorrent reports errors by throwing C++ exceptions. All exceptions inherit from `torrent::base_error`, which itself inherits from `std::exception`, so you can always catch everything libTorrent throws with a single `catch (const torrent::base_error&)` clause. Understanding the hierarchy lets you handle recoverable errors—such as a bad `.torrent` file—separately from fatal ones such as internal library bugs.
+
+## Exception hierarchy
+
+```
+std::exception
+└── torrent::base_error
+    ├── torrent::internal_error          # Library bug — includes a stack backtrace
+    ├── torrent::network_error           # Network-level failure (abstract)
+    │   ├── torrent::communication_error # Protocol/tracker communication failure
+    │   ├── torrent::connection_error    # Socket error (carries errno)
+    │   ├── torrent::address_info_error  # DNS/address resolution error (carries errno)
+    │   ├── torrent::close_connection    # Signal: close this connection
+    │   └── torrent::blocked_connection  # Signal: connection is blocked
+    ├── torrent::local_error             # Local system failure (abstract)
+    │   ├── torrent::storage_error       # Disk/file system error
+    │   ├── torrent::resource_error      # Resource exhaustion
+    │   └── torrent::input_error         # Bad input data
+    │       └── torrent::bencode_error   # Bencode parse or type error
+    └── torrent::shutdown_exception      # Clean shutdown signal
+```
+
+## base_error
+
+`torrent::base_error` is the root of all libTorrent exceptions. Catching it lets you handle every libTorrent exception in one place without catching unrelated `std::exception` subclasses from other libraries.
+
+```cpp
+#include <torrent/exceptions.h>
+
+try {
+    torrent::download_add(object, tracker_key);
+} catch (const torrent::base_error& e) {
+    std::cerr << "libTorrent error: " << e.what() << '\n';
+}
+```
+
+## internal_error
+
+`internal_error` indicates a bug inside libTorrent itself—a violated invariant, unexpected null pointer, or other consistency failure. When you catch one, log it and terminate; the library state is undefined after an `internal_error`.
+
+```cpp
+class internal_error : public base_error {
+public:
+    internal_error(const char* msg);
+    internal_error(const char* msg, const std::string& context);
+    internal_error(const char* msg, const HashString& hash);
+    internal_error(const std::string& msg);
+
+    const char*        what()      const noexcept override;
+    const std::string& backtrace() const noexcept;
+
+    void               push_front(const std::string& msg);
+};
+```
+
+`backtrace()` returns a multi-line stack trace captured at throw time—include it in crash reports. `push_front()` lets intermediate catch-and-rethrow handlers prepend context to the message.
+
+```cpp
+try {
+    run_download_loop();
+} catch (const torrent::internal_error& e) {
+    std::cerr << "Internal libTorrent error: " << e.what() << '\n'
+              << e.backtrace();
+    std::terminate();
+}
+```
+
+<Warning>
+  Do not attempt to continue using libTorrent after catching an `internal_error`. Call `torrent::cleanup()` and restart your process.
+</Warning>
+
+## network_error and its subclasses
+
+`network_error` is an abstract base for all failures that occur over the network. Catch it when you want to handle any network problem uniformly.
+
+### communication_error
+
+Thrown when the library cannot complete a protocol exchange with a tracker or peer—for example, an unexpected HTTP response or a malformed announce reply.
+
+```cpp
+class communication_error : public network_error {
+public:
+    communication_error(const char* msg);
+    communication_error(const std::string& msg);
+
+    const char* what() const noexcept override;
+};
+```
+
+### connection_error
+
+Wraps a POSIX `errno` value from a failed socket operation. Call `get_errno()` to get the raw error code and pass it to `strerror()` for a human-readable message.
+
+```cpp
+class connection_error : public network_error {
+public:
+    connection_error(int err);
+
+    const char* what()      const noexcept override;
+    int         get_errno() const;
+};
+```
+
+```cpp
+} catch (const torrent::connection_error& e) {
+    std::cerr << "Socket error: " << strerror(e.get_errno()) << '\n';
+}
+```
+
+### address_info_error
+
+Thrown when DNS resolution fails. `get_errno()` returns the `getaddrinfo()` error code; pass it to `gai_strerror()` for a descriptive message.
+
+```cpp
+class address_info_error : public network_error {
+public:
+    address_info_error(int err);
+
+    const char* what()      const noexcept override;
+    int         get_errno() const;
+};
+```
+
+```cpp
+} catch (const torrent::address_info_error& e) {
+    std::cerr << "DNS error: " << gai_strerror(e.get_errno()) << '\n';
+}
+```
+
+### close_connection and blocked_connection
+
+These are signaling exceptions used internally to tear down individual connections. You may encounter them in custom event handlers; catch and discard them at the connection boundary.
+
+```cpp
+class close_connection   : public network_error {};
+class blocked_connection : public network_error {};
+```
+
+## local_error and its subclasses
+
+`local_error` is an abstract base for failures that originate on the local machine rather than over the network.
+
+### storage_error
+
+Thrown when a disk or file system operation fails—for example, when the library cannot read or write a chunk because the disk is full or a file permission is wrong.
+
+```cpp
+class storage_error : public local_error {
+public:
+    storage_error(const char* msg);
+    storage_error(const std::string& msg);
+
+    const char* what() const noexcept override;
+};
+```
+
+### resource_error
+
+Thrown when a system resource is exhausted—for example, when the file descriptor limit is reached.
+
+```cpp
+class resource_error : public local_error {
+public:
+    resource_error(const char* msg);
+    resource_error(const std::string& msg);
+
+    const char* what() const noexcept override;
+};
+```
+
+### input_error
+
+Thrown when the library receives invalid data from your application—for example, a malformed info-hash or an `Object` with the wrong structure.
+
+```cpp
+class input_error : public local_error {
+public:
+    input_error(const char* msg);
+    input_error(const std::string& msg);
+
+    const char* what() const noexcept override;
+};
+```
+
+### bencode_error
+
+A subclass of `input_error` thrown specifically when bencode parsing fails or when your code reads an `Object` field as the wrong type (e.g., calling `as_string()` on a dictionary).
+
+```cpp
+class bencode_error : public input_error {
+public:
+    using input_error::input_error; // inherits all constructors
+};
+```
+
+```cpp
+try {
+    torrent::Object obj = torrent::Object::create_value(42);
+    auto& s = obj.as_string(); // wrong type — throws bencode_error
+} catch (const torrent::bencode_error& e) {
+    std::cerr << "Bencode type error: " << e.what() << '\n';
+}
+```
+
+## shutdown_exception
+
+`shutdown_exception` is a clean-shutdown signal, not an error. The library throws it internally when a thread's event loop should exit. You should not throw or catch it in application code under normal circumstances.
+
+```cpp
+class shutdown_exception : public base_error {};
+```
+
+## Recommended catch patterns
+
+### Handling a single download operation
+
+```cpp
+try {
+    torrent::Download d = torrent::download_add(torrent_object, key);
+    d.open();
+    d.hash_check(0);
+    d.start();
+} catch (const torrent::bencode_error& e) {
+    // The .torrent data is malformed.
+    std::cerr << "Bad torrent: " << e.what() << '\n';
+} catch (const torrent::input_error& e) {
+    // Other bad input (catches bencode_error too if bencode_error is not caught above).
+    std::cerr << "Input error: " << e.what() << '\n';
+} catch (const torrent::storage_error& e) {
+    // Disk problem.
+    std::cerr << "Storage error: " << e.what() << '\n';
+} catch (const torrent::network_error& e) {
+    // Any network failure.
+    std::cerr << "Network error: " << e.what() << '\n';
+} catch (const torrent::internal_error& e) {
+    std::cerr << "Internal error: " << e.what() << '\n'
+              << e.backtrace();
+    std::terminate();
+}
+```
+
+### Catching everything libTorrent throws
+
+```cpp
+try {
+    run_event_loop();
+} catch (const torrent::base_error& e) {
+    std::cerr << "libTorrent: " << e.what() << '\n';
+}
+```
+
+<Note>
+  Catch `internal_error` before `base_error` in the same `try` block so you can log the backtrace separately. Once you catch `base_error`, the dynamic type is lost.
+</Note>
